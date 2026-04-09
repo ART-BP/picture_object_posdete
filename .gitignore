@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / local tool metadata
+.DS_Store
+.idea/
+.vscode/
+.codex
+.codex/
+**/.codex/
+.asset
+.asset/
+**/.asset/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+GroundingDINO/build/
+GroundingDINO/groundingdino.egg-info/
+MobileSAM/mobile_sam.egg-info/
+
+# Model weights and large artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# ROS / runtime outputs
+output/
+*.bag
+*.log
+
+# Downloaded caches
+GroundingDINO/cache/
+
+# Demo / generated outputs
+GroundingDINO/demo_output/
+MobileSAM/demo/demo_output/
