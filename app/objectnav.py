@@ -87,7 +87,7 @@ class FusionLidarCameraNode:
         self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
         try:
             rospy.loginfo("Waiting for move_base action server...")
-            self.client.wait_for_server(rospy.Duration(10.0))
+            self.client.wait_for_server(rospy.Duration(2.0))
             rospy.loginfo("Connected to move_base action server.")
         except rospy.ROSException as e:
             rospy.logerr("Failed to connect to move_base action server: %s", str(e))
@@ -372,21 +372,93 @@ class FusionLidarCameraNode:
                 raise ValueError(f"PointCloud2 missing '{axis}' field. available={sorted(field_names)}")
         return u_name, v_name
 
-    def _read_xyzuv(self, cloud_msg: PointCloud2) -> np.ndarray:
-        """Read (x,y,z,u,v) points from PointCloud2 into an Nx5 float32 array."""
+    def _read_xyzuv(self, cloud_msg: PointCloud2, h: int, w: int) -> Tuple[np.ndarray, float]:
+        """Vectorized PointCloud2 decode: return in-bound finite (x,y,z,u,v) and inside ratio."""
         u_name, v_name = self._resolve_uv_fields(cloud_msg)
-        rows: List[Tuple[float, float, float, float, float]] = []
-        for x, y, z, u, v in pc2.read_points(
-            cloud_msg,
-            field_names=("x", "y", "z", u_name, v_name),
-            skip_nans=True,
-        ):
-            rows.append((float(x), float(y), float(z), float(u), float(v)))
+        field_map = {f.name: f for f in cloud_msg.fields}
+        dtype_map = {
+            PointField.INT8: "i1",
+            PointField.UINT8: "u1",
+            PointField.INT16: "i2",
+            PointField.UINT16: "u2",
+            PointField.INT32: "i4",
+            PointField.UINT32: "u4",
+            PointField.FLOAT32: "f4",
+            PointField.FLOAT64: "f8",
+        }
 
-        if not rows:
-            return np.zeros((0, 5), dtype=np.float32)
-        return np.asarray(rows, dtype=np.float32)
+        names: List[str] = []
+        formats: List[str] = []
+        offsets: List[int] = []
+        endian = ">" if cloud_msg.is_bigendian else "<"
+        for name in ("x", "y", "z", u_name, v_name):
+            field = field_map[name]
+            if int(field.count) != 1:
+                raise ValueError(f"Field '{name}' has count={field.count}, only scalar fields are supported")
+            base_fmt = dtype_map.get(field.datatype)
+            if base_fmt is None:
+                raise ValueError(f"Unsupported PointField datatype={field.datatype} for field '{name}'")
+            names.append(name)
+            formats.append(endian + base_fmt)
+            offsets.append(int(field.offset))
 
+        point_dtype = np.dtype(
+            {
+                "names": names,
+                "formats": formats,
+                "offsets": offsets,
+                "itemsize": int(cloud_msg.point_step),
+            }
+        )
+
+        width = int(cloud_msg.width)
+        height = int(cloud_msg.height)
+        n_points = width * height
+        if n_points <= 0:
+            return np.zeros((0, 5), dtype=np.float32), 0.0
+
+        expected_bytes = int(cloud_msg.row_step) * height
+        if len(cloud_msg.data) < expected_bytes:
+            raise ValueError(
+                f"PointCloud2 data too short: len(data)={len(cloud_msg.data)} expected>={expected_bytes}"
+            )
+
+        points = np.ndarray(
+            shape=(height, width),
+            dtype=point_dtype,
+            buffer=cloud_msg.data,
+            strides=(int(cloud_msg.row_step), int(cloud_msg.point_step)),
+        )
+
+        x = np.asarray(points["x"], dtype=np.float32).reshape(-1)
+        y = np.asarray(points["y"], dtype=np.float32).reshape(-1)
+        z = np.asarray(points["z"], dtype=np.float32).reshape(-1)
+        u = np.asarray(points[u_name], dtype=np.float32).reshape(-1)
+        v = np.asarray(points[v_name], dtype=np.float32).reshape(-1)
+
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(u) & np.isfinite(v)
+        finite_count = int(np.count_nonzero(finite))
+        if finite_count == 0:
+            return np.zeros((0, 5), dtype=np.float32), 0.0
+
+        x = x[finite]
+        y = y[finite]
+        z = z[finite]
+        u = u[finite]
+        v = v[finite]
+
+        inside = (u >= 0.0) & (u < float(w)) & (v >= 0.0) & (v < float(h))
+        inside_count = int(np.count_nonzero(inside))
+        if inside_count == 0:
+            return np.zeros((0, 5), dtype=np.float32), 0.0
+
+        xyzuv_inside = np.stack((x[inside], y[inside], z[inside], u[inside], v[inside]), axis=1).astype(
+            np.float32, copy=False
+        )
+        ratio = float(inside_count) / float(finite_count)
+        inside_ratio = ratio if 0.0 < ratio < 1.0 else 0.0
+        return xyzuv_inside, inside_ratio
+    
     def _to_pixel_uv(self, uv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Convert uv fields to integer pixel indices with optional u/v swap."""
         if self.swap_uv:
@@ -565,21 +637,15 @@ class FusionLidarCameraNode:
                 k = self.mask_dilate_px * 2 + 1
                 kernel = np.ones((k, k), dtype=np.uint8)
                 mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-
-            xyzuv = self._read_xyzuv(cloud_msg)
-            if xyzuv.shape[0] == 0:
+            
+            h, w = mask.shape[:2]
+            xyzuv_inside, inside_ratio = self._read_xyzuv(cloud_msg, h, w)
+            if xyzuv_inside.shape[0] == 0:
                 rospy.logwarn("No points from %s", self.topic_visual_points)
                 return
 
-            h, w = mask.shape[:2]
-            u, v = self._to_pixel_uv(xyzuv[:, 3:5])
+            u_inside, v_inside = self._to_pixel_uv(xyzuv_inside[:, 3:5])
 
-            #  限制在图像范围内
-            inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-            inside_ratio = float(np.mean(inside)) if inside.size > 0 else 0.0
-            xyzuv_inside = xyzuv[inside]
-            u_inside = u[inside]
-            v_inside = v[inside]
             if xyzuv_inside.shape[0] == 0:
                 rospy.logwarn("No projected points inside image bounds")
                 return
