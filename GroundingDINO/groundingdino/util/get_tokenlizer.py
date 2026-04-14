@@ -171,7 +171,8 @@ def get_tokenlizer(text_encoder_type):
             raise ValueError(
                 "Unknown type of text_encoder_type: {}".format(type(text_encoder_type))
             )
-    print("final text_encoder_type: {}".format(text_encoder_type))
+    if os.environ.get("GROUNDINGDINO_VERBOSE", "0") == "1":
+        print("final text_encoder_type: {}".format(text_encoder_type))
 
     tokenizer = _from_pretrained_with_retry(AutoTokenizer, text_encoder_type)
     return tokenizer

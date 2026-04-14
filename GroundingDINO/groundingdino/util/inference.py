@@ -1,3 +1,5 @@
+import contextlib
+import os
 from typing import Tuple, List
 
 import cv2
@@ -26,9 +28,22 @@ def preprocess_caption(caption: str) -> str:
     return result + "."
 
 
+def _get_resize_cfg() -> Tuple[int, int]:
+    short_side = int(os.environ.get("GROUNDINGDINO_RESIZE_SHORT", "800"))
+    max_size = int(os.environ.get("GROUNDINGDINO_RESIZE_MAX", "1333"))
+    short_side = max(64, short_side)
+    max_size = max(short_side, max_size)
+    return short_side, max_size
+
+
 def load_model(model_config_path: str, model_checkpoint_path: str, device: str = "cuda"):
     args = SLConfig.fromfile(model_config_path)
     args.device = device
+    # Gradient checkpointing slows down inference and may emit warnings in eval mode.
+    if hasattr(args, "use_checkpoint"):
+        args.use_checkpoint = False
+    if hasattr(args, "use_transformer_ckpt"):
+        args.use_transformer_ckpt = False
     model = build_model(args)
     checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
     model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
@@ -37,9 +52,10 @@ def load_model(model_config_path: str, model_checkpoint_path: str, device: str =
 
 
 def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
+    resize_short, resize_max = _get_resize_cfg()
     transform = T.Compose(
         [
-            T.RandomResize([800], max_size=1333),
+            T.RandomResize([resize_short], max_size=resize_max),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -61,21 +77,41 @@ def predict(
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     caption = preprocess_caption(caption=caption)
 
-    model = model.to(device)
-    image = image.to(device)
+    # Model is moved to device during construction; avoid repeated .to(device) per frame.
+    image = image.to(device, non_blocking=True)
+    use_amp = (
+        str(device).startswith("cuda")
+        and torch.cuda.is_available()
+        and os.environ.get("GROUNDINGDINO_USE_AMP", "1") == "1"
+    )
+    if use_amp:
+        try:
+            autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        except Exception:
+            autocast_ctx = torch.cuda.amp.autocast(enabled=True)
+    else:
+        autocast_ctx = contextlib.nullcontext()
+    with torch.inference_mode():
+        with autocast_ctx:
+            outputs = model(image[None], captions=[caption])
 
-    with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
-
-    prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]  # prediction_logits.shape = (nq, 256)
-    prediction_boxes = outputs["pred_boxes"].cpu()[0]  # prediction_boxes.shape = (nq, 4)
+    # Keep tensors on device for filtering, move only selected outputs to CPU.
+    prediction_logits = outputs["pred_logits"][0].sigmoid()  # (nq, 256)
+    prediction_boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
     mask = prediction_logits.max(dim=1)[0] > box_threshold
-    logits = prediction_logits[mask]  # logits.shape = (n, 256)
-    boxes = prediction_boxes[mask]  # boxes.shape = (n, 4)
+    logits = prediction_logits[mask].float().cpu()  # (n, 256)
+    boxes = prediction_boxes[mask].float().cpu()  # (n, 4)
 
     tokenizer = model.tokenizer
-    tokenized = tokenizer(caption)
+    tokenized_cache = getattr(model, "_tokenized_caption_cache", None)
+    if tokenized_cache is None:
+        tokenized_cache = {}
+        setattr(model, "_tokenized_caption_cache", tokenized_cache)
+    tokenized = tokenized_cache.get(caption)
+    if tokenized is None:
+        tokenized = tokenizer(caption)
+        tokenized_cache[caption] = tokenized
     
     if remove_combined:
         sep_idx = [i for i in range(len(tokenized['input_ids'])) if tokenized['input_ids'][i] in [101, 102, 1012]]
@@ -237,9 +273,10 @@ class Model:
 
     @staticmethod
     def preprocess_image(image_bgr: np.ndarray) -> torch.Tensor:
+        resize_short, resize_max = _get_resize_cfg()
         transform = T.Compose(
             [
-                T.RandomResize([800], max_size=1333),
+                T.RandomResize([resize_short], max_size=resize_max),
                 T.ToTensor(),
                 T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]

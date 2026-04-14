@@ -70,7 +70,7 @@ class FusionLidarCameraNode:
         self.tf_listener = tf.TransformListener()
 
         self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/debug_image", Image, queue_size=1, latch=True)
-        self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
+        # self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
         self.pub_depth_json = rospy.Publisher("/fusion_lidar_camera/object_depth_json", String, latch=True, queue_size=2)
 
         #  注册雷达和图像同步
@@ -229,7 +229,8 @@ class FusionLidarCameraNode:
         dense_mask = counts >= max(1, int(min_points_per_cell))
         if not np.any(dense_mask):
             center = np.median(pts, axis=0).astype(np.float32)
-            nearest_idx = int(np.argmin(np.linalg.norm(pts, axis=1)))
+            # Same ordering as norm(), but avoids sqrt for better speed.
+            nearest_idx = int(np.argmin(np.sum(pts * pts, axis=1)))
             nearest_xy = pts[nearest_idx].astype(np.float32)
             return center, nearest_xy
 
@@ -283,7 +284,8 @@ class FusionLidarCameraNode:
                 cluster_pts = pts
 
         center = np.median(cluster_pts, axis=0).astype(np.float32)
-        nearest_idx = int(np.argmin(np.linalg.norm(cluster_pts, axis=1)))
+        # Same ordering as norm(), but avoids sqrt for better speed.
+        nearest_idx = int(np.argmin(np.sum(cluster_pts * cluster_pts, axis=1)))
         nearest_xy = cluster_pts[nearest_idx].astype(np.float32)
         return center, nearest_xy
 
@@ -435,15 +437,21 @@ class FusionLidarCameraNode:
         num_points: int,
     ) -> dict:
         """Build JSON payload for object center and nearest surface point."""
+        center_arr = np.asarray(center, dtype=np.float32) if center is not None else None
+        nearest_arr = (
+            np.asarray(nearest_surface_xy, dtype=np.float32)
+            if nearest_surface_xy is not None
+            else None
+        )
         valid_center = (
-            center is not None
-            and np.asarray(center).shape[0] >= 2
-            and np.all(np.isfinite(np.asarray(center)[:2]))
+            center_arr is not None
+            and center_arr.shape[0] >= 2
+            and np.all(np.isfinite(center_arr[:2]))
         )
         valid_nearest = (
-            nearest_surface_xy is not None
-            and np.asarray(nearest_surface_xy).shape[0] >= 2
-            and np.all(np.isfinite(np.asarray(nearest_surface_xy)[:2]))
+            nearest_arr is not None
+            and nearest_arr.shape[0] >= 2
+            and np.all(np.isfinite(nearest_arr[:2]))
         )
         if num_points < self.min_points or not valid_center or not valid_nearest:
             return {
@@ -458,7 +466,7 @@ class FusionLidarCameraNode:
                 "nearest_surface_dist_m": None,
             }
 
-        nearest_dist = float(np.linalg.norm(np.asarray(nearest_surface_xy, dtype=np.float32)[:2]))
+        nearest_dist = float(np.linalg.norm(nearest_arr[:2]))
         return {
             "stamp": stamp_sec,
             "frame_id": frame_id,
@@ -466,8 +474,8 @@ class FusionLidarCameraNode:
             "bbox_xyxy": box_xyxy,
             "gdino_score": gdino_score,
             "num_points": int(num_points),
-            "centroid_xy_m": [float(center[0]), float(center[1])],
-            "nearest_surface_xy_m": [float(nearest_surface_xy[0]), float(nearest_surface_xy[1])],
+            "centroid_xy_m": [float(center_arr[0]), float(center_arr[1])],
+            "nearest_surface_xy_m": [float(nearest_arr[0]), float(nearest_arr[1])],
             "nearest_surface_dist_m": nearest_dist,
         }
     
@@ -588,7 +596,7 @@ class FusionLidarCameraNode:
                     self.min_points,
                 )
 
-            self.pub_object_points.publish(self._build_cloud_xyz(cloud_msg.header, object_xyz))
+            # self.pub_object_points.publish(self._build_cloud_xyz(cloud_msg.header, object_xyz))
 
             if object_xyz.shape[0] > 0:
                 min_points_per_cell, min_cluster_points = self._cluster_params(object_xyz.shape[0])

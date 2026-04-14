@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -11,6 +14,12 @@ import torch
 root = Path(__file__).resolve().parent
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Overwriting tiny_vit_.* in registry .* name being registered conflicts with an existing name\.",
+    category=UserWarning,
+)
 
 from mobile_sam import SamPredictor, sam_model_registry
 
@@ -27,6 +36,7 @@ class Sam:
         checkpoint: Optional[PathLike] = None,
         model_type: str = "vit_t",
         device: Optional[str] = None,
+        use_amp: Optional[bool] = None,
     ) -> None:
         ckpt = Path(checkpoint) if checkpoint is not None else root / "weights" / "mobile_sam.pt"
         if not ckpt.exists():
@@ -35,11 +45,24 @@ class Sam:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        if use_amp is None:
+            env_flag = str(os.environ.get("MOBILESAM_USE_AMP", "1")).strip().lower()
+            use_amp = env_flag not in ("0", "false", "no", "off")
+
         self.device = device
+        self.use_amp = bool(use_amp) and str(self.device).startswith("cuda") and torch.cuda.is_available()
         self.model = sam_model_registry[model_type](checkpoint=str(ckpt))
         self.model.to(device=self.device).eval()
         self.predictor = SamPredictor(self.model)
         self.image_rgb: Optional[ArrayLike] = None
+
+    def _autocast_ctx(self):
+        if not self.use_amp:
+            return contextlib.nullcontext()
+        try:
+            return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        except Exception:
+            return torch.cuda.amp.autocast(enabled=True)
 
     @staticmethod
     def _read_image(image: Union[PathLike, ArrayLike], image_format: str = "BGR") -> ArrayLike:
@@ -63,7 +86,9 @@ class Sam:
 
     def set_image(self, image: Union[PathLike, ArrayLike], image_format: str = "BGR") -> None:
         self.image_rgb = self._read_image(image, image_format=image_format)
-        self.predictor.set_image(self.image_rgb)
+        with torch.inference_mode():
+            with self._autocast_ctx():
+                self.predictor.set_image(self.image_rgb)
 
     @staticmethod
     def _ensure_xyxy(box_xyxy: Union[Tuple[float, float, float, float], ArrayLike]) -> ArrayLike:
@@ -94,11 +119,13 @@ class Sam:
             raise RuntimeError("Call set_image(...) first, or pass image=... to predict_with_box().")
 
         box = self._ensure_xyxy(box_xyxy)
-        return self.predictor.predict(
-            box=box,
-            multimask_output=multimask_output,
-            return_logits=return_logits,
-        )
+        with torch.inference_mode():
+            with self._autocast_ctx():
+                return self.predictor.predict(
+                    box=box,
+                    multimask_output=multimask_output,
+                    return_logits=return_logits,
+                )
 
     def get_mask_by_box(
         self,
@@ -137,12 +164,14 @@ class Sam:
         if labels.ndim != 1 or labels.shape[0] != coords.shape[0]:
             raise ValueError("point_labels must be N and match point_coords")
 
-        return self.predictor.predict(
-            point_coords=coords,
-            point_labels=labels,
-            multimask_output=multimask_output,
-            return_logits=return_logits,
-        )
+        with torch.inference_mode():
+            with self._autocast_ctx():
+                return self.predictor.predict(
+                    point_coords=coords,
+                    point_labels=labels,
+                    multimask_output=multimask_output,
+                    return_logits=return_logits,
+                )
 
     def get_mask_by_points(
         self,

@@ -1,7 +1,0 @@
-python gdino_local.py --image demo_input/left0000.jpg 
---caption "black box" 
---box-threshold 0.40 
---text-threshold 0.25 
---save-annotated deme_output/local_result.jpg
-
-

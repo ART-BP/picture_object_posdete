@@ -12,9 +12,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath as TimmDropPath,\
-    to_2tuple, trunc_normal_
-from timm.models.registry import register_model
+try:
+    from timm.layers import DropPath as TimmDropPath, to_2tuple, trunc_normal_
+except ImportError:
+    from timm.models.layers import DropPath as TimmDropPath, to_2tuple, trunc_normal_
+
+try:
+    from timm.models import register_model
+except ImportError:
+    from timm.models.registry import register_model
 from typing import Tuple
 
 

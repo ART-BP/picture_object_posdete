@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -8,6 +9,26 @@ import cv2
 import numpy as np
 import supervision as sv
 import torch
+
+try:
+    import torchvision
+
+    disable_beta_warning = getattr(torchvision, "disable_beta_transforms_warning", None)
+    if callable(disable_beta_warning):
+        disable_beta_warning()
+except Exception:
+    pass
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"The `device` argument is deprecated and will be removed in v5 of Transformers\.",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"None of the inputs have requires_grad=True\. Gradients will be None",
+    category=UserWarning,
+)
 
 root_gdino = os.path.dirname(os.path.abspath(__file__))
 if root_gdino not in sys.path:

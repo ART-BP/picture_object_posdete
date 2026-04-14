@@ -118,7 +118,10 @@ def masks_to_boxes(masks):
 
     y = torch.arange(0, h, dtype=torch.float)
     x = torch.arange(0, w, dtype=torch.float)
-    y, x = torch.meshgrid(y, x)
+    try:
+        y, x = torch.meshgrid(y, x, indexing="ij")
+    except TypeError:
+        y, x = torch.meshgrid(y, x)
 
     x_mask = masks * x.unsqueeze(0)
     x_max = x_mask.flatten(1).max(-1)[0]
@@ -135,6 +138,6 @@ if __name__ == "__main__":
     x = torch.rand(5, 4)
     y = torch.rand(3, 4)
     iou, union = box_iou(x, y)
-    import ipdb
+    import pdb
 
-    ipdb.set_trace()
+    pdb.set_trace()
