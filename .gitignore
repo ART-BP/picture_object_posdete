@@ -24,6 +24,8 @@ env/
 # Build / packaging
 build/
 dist/
+bag/
+envs/
 *.egg-info/
 GroundingDINO/build/
 GroundingDINO/groundingdino.egg-info/

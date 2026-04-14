@@ -1,7 +1,15 @@
 import rospy
 import os
+import sys
 import numpy as np
 import cv2
+
+# # Allow running this file directly via:
+# #   python app/getmask_object.py
+# # so sibling top-level packages (GroundingDINO, MobileSAM) are importable.
+# ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# if ROOT_DIR not in sys.path:
+#     sys.path.insert(0, ROOT_DIR)
 
 from sensor_msgs.msg import Image
 from GroundingDINO.gdino import GroundingDINO
@@ -130,7 +138,7 @@ class ObjectDetection:
             image_format="BGR",
             multimask_output=False,
         )
-        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output_fusion")
         os.makedirs(output_dir, exist_ok=True)
 
         now = self.image_header.stamp

@@ -1,0 +1,5 @@
+rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"white wall\"}'"
+rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"white column\"}'"
+rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"black box\"}'"
+rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"The person wearing yellow clothes\"}'"
+rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"cancel\",\"caption\":\"black box\"}'"
