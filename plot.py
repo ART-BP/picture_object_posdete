@@ -38,7 +38,7 @@ def main():
     plt.xlabel("num")
     plt.ylabel("deltatime_detection (s)")
     plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0, fontsize=8)
+    plt.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0, fontsize=14)
     plt.tight_layout(rect=[0.0, 0.0, 1, 1])
 
     plt.show()
