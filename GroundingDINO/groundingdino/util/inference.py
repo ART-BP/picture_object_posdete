@@ -20,6 +20,8 @@ from groundingdino.util.utils import get_phrases_from_posmap
 # OLD API
 # ----------------------------------------------------------------------------------------------------------------------
 
+_TRANSFORM_CACHE = {}
+
 
 def preprocess_caption(caption: str) -> str:
     result = caption.lower().strip()
@@ -34,6 +36,22 @@ def _get_resize_cfg() -> Tuple[int, int]:
     short_side = max(64, short_side)
     max_size = max(short_side, max_size)
     return short_side, max_size
+
+
+def _get_preprocess_transform():
+    resize_short, resize_max = _get_resize_cfg()
+    key = (int(resize_short), int(resize_max))
+    transform = _TRANSFORM_CACHE.get(key)
+    if transform is None:
+        transform = T.Compose(
+            [
+                T.RandomResize([resize_short], max_size=resize_max),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        _TRANSFORM_CACHE[key] = transform
+    return transform
 
 
 def load_model(model_config_path: str, model_checkpoint_path: str, device: str = "cuda"):
@@ -52,14 +70,7 @@ def load_model(model_config_path: str, model_checkpoint_path: str, device: str =
 
 
 def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
-    resize_short, resize_max = _get_resize_cfg()
-    transform = T.Compose(
-        [
-            T.RandomResize([resize_short], max_size=resize_max),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-    )
+    transform = _get_preprocess_transform()
     image_source = Image.open(image_path).convert("RGB")
     image = np.asarray(image_source)
     image_transformed, _ = transform(image_source, None)
@@ -73,7 +84,9 @@ def predict(
         box_threshold: float,
         text_threshold: float,
         device: str = "cuda",
-        remove_combined: bool = False
+        remove_combined: bool = False,
+        return_phrases: bool = True,
+        max_detections: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     caption = preprocess_caption(caption=caption)
 
@@ -99,9 +112,24 @@ def predict(
     prediction_logits = outputs["pred_logits"][0].sigmoid()  # (nq, 256)
     prediction_boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
-    mask = prediction_logits.max(dim=1)[0] > box_threshold
-    logits = prediction_logits[mask].float().cpu()  # (n, 256)
-    boxes = prediction_boxes[mask].float().cpu()  # (n, 4)
+    score_all = prediction_logits.max(dim=1)[0]
+    mask = score_all > box_threshold
+    logits_keep = prediction_logits[mask]  # (n, 256)
+    boxes_keep = prediction_boxes[mask]  # (n, 4)
+    score_keep = score_all[mask]  # (n,)
+
+    if max_detections is not None and int(max_detections) > 0 and score_keep.numel() > int(max_detections):
+        topk_idx = torch.topk(score_keep, k=int(max_detections), dim=0).indices
+        logits_keep = logits_keep[topk_idx]
+        boxes_keep = boxes_keep[topk_idx]
+        score_keep = score_keep[topk_idx]
+
+    logits = logits_keep.float().cpu()
+    boxes = boxes_keep.float().cpu()
+    scores = score_keep.float().cpu()
+
+    if not return_phrases:
+        return boxes, scores, []
 
     tokenizer = model.tokenizer
     tokenized_cache = getattr(model, "_tokenized_caption_cache", None)
@@ -130,7 +158,7 @@ def predict(
             in logits
         ]
 
-    return boxes, logits.max(dim=1)[0], phrases
+    return boxes, scores, phrases
 
 
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
@@ -190,7 +218,9 @@ class Model:
         image: np.ndarray,
         caption: str,
         box_threshold: float = 0.35,
-        text_threshold: float = 0.25
+        text_threshold: float = 0.25,
+        return_phrases: bool = True,
+        max_detections: int = 0,
     ) -> Tuple[sv.Detections, List[str]]:
         """
         import cv2
@@ -217,7 +247,10 @@ class Model:
             caption=caption,
             box_threshold=box_threshold,
             text_threshold=text_threshold, 
-            device=self.device)
+            device=self.device,
+            return_phrases=return_phrases,
+            max_detections=max_detections,
+        )
         source_h, source_w, _ = image.shape
         detections = Model.post_process_result(
             source_h=source_h,
@@ -273,14 +306,7 @@ class Model:
 
     @staticmethod
     def preprocess_image(image_bgr: np.ndarray) -> torch.Tensor:
-        resize_short, resize_max = _get_resize_cfg()
-        transform = T.Compose(
-            [
-                T.RandomResize([resize_short], max_size=resize_max),
-                T.ToTensor(),
-                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
+        transform = _get_preprocess_transform()
         image_pillow = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
         image_transformed, _ = transform(image_pillow, None)
         return image_transformed

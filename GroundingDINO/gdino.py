@@ -125,6 +125,8 @@ class GroundingDINO(Model):
         box_threshold: float = 0.40,
         text_threshold: float = 0.25,
         image_format: str = "BGR",
+        return_labels: bool = True,
+        max_detections: int = 0,
     ) -> Tuple[sv.Detections, List[str]]:
         if image is not None:
             current_image = self.set_image(image, image_format=image_format)
@@ -139,6 +141,8 @@ class GroundingDINO(Model):
             caption=caption_text,
             box_threshold=box_threshold,
             text_threshold=text_threshold,
+            return_phrases=return_labels,
+            max_detections=max_detections,
         )
 
     def predict_from_path(

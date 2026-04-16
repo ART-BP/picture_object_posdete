@@ -6,3 +6,6 @@ rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"capti
 rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"The person wearing yellow clothes\"}'"
 rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"person\"}'"
 rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"cancel\",\"caption\":\"black box\"}'"
+
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 4 python -m app.objectnav
+
