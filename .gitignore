@@ -37,6 +37,7 @@ MobileSAM/mobile_sam.egg-info/
 *.ckpt
 *.onnx
 *.engine
+*.ts
 
 # ROS / runtime outputs
 output/
