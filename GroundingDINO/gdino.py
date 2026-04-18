@@ -41,7 +41,6 @@ PathLike = Union[str, os.PathLike]
 ImageLike = Union[np.ndarray, PathLike]
 
 
-
 class GroundingDINO(Model):
     """GroundingDINO wrapper ."""
 
@@ -74,10 +73,34 @@ class GroundingDINO(Model):
         self.model_config_path = str(model_config)
         self.model_checkpoint_path = str(model_checkpoint)
         self.caption = caption
+        self.box_threshold = 0.40
+        self.text_threshold = 0.25
+        self.return_labels = True
+        self.max_detections = 1
+
         self.image: Optional[np.ndarray] = None
         self.box_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
         self.label_annotator = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX)
-
+    
+    def setparameters(
+        self,
+        caption: Optional[str] = None,
+        box_threshold: Optional[float] = None,
+        text_threshold: Optional[float] = None,
+        return_labels: Optional[bool] = None,
+        max_detections: Optional[int] = None,
+    ) -> None:
+        if caption is not None:
+            self.caption = caption
+        if box_threshold is not None:
+            self.box_threshold = box_threshold
+        if text_threshold is not None:
+            self.text_threshold = text_threshold
+        if return_labels is not None:
+            self.return_labels = return_labels
+        if max_detections is not None:
+            self.max_detections = max_detections
+            
     @staticmethod
     def default_model_config_path() -> Path:
         return Path(root_gdino) / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"
@@ -109,7 +132,7 @@ class GroundingDINO(Model):
 
         fmt = image_format.upper()
         if fmt == "BGR":
-            return image.copy()
+            return image
         if fmt == "RGB":
             return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         raise ValueError("image_format must be 'BGR' or 'RGB'")
@@ -122,14 +145,9 @@ class GroundingDINO(Model):
         self,
         image: Optional[ImageLike] = None,
         caption: Optional[str] = None,
-        box_threshold: float = 0.40,
-        text_threshold: float = 0.25,
-        image_format: str = "BGR",
-        return_labels: bool = True,
-        max_detections: int = 0,
     ) -> Tuple[sv.Detections, List[str]]:
         if image is not None:
-            current_image = self.set_image(image, image_format=image_format)
+            current_image = self.set_image(image, image_format="BGR")
         elif self.image is not None:
             current_image = self.image
         else:
@@ -139,10 +157,10 @@ class GroundingDINO(Model):
         return self.predict_with_caption(
             image=current_image,
             caption=caption_text,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            return_phrases=return_labels,
-            max_detections=max_detections,
+            box_threshold=self.box_threshold,
+            text_threshold=self.text_threshold,
+            return_phrases=self.return_labels,
+            max_detections=self.max_detections,
         )
 
     def predict_from_path(

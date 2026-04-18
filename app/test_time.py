@@ -9,6 +9,7 @@ import torch
 
 from GroundingDINO import gdino
 from MobileSAM.sam import Sam
+from yoloe.yoloe import Yoloe
 
 rootdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,10 +49,11 @@ def main():
     sleep_s = float(rospy.get_param("~sleep_s", 0.0))
     resize_scale = float(rospy.get_param("~resize_scale", 1.0))
     reuse_sam_image_embedding = _as_bool(rospy.get_param("~reuse_sam_image_embedding", False))
-    output_file = rospy.get_param("~output_file", os.path.join(rootdir, "time_data.txt"))
 
     t0 = time.perf_counter()
     model = gdino.GroundingDINO()
+    model.setparameters(caption=caption, box_threshold=box_threshold, text_threshold=text_threshold)
+    
     sam_model = Sam()
     t1 = time.perf_counter()
     rospy.loginfo("construct model cost: %.4fs", t1 - t0)
@@ -83,10 +85,6 @@ def main():
         detections, _ = model.predict(
             image=image,
             caption=caption,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            return_labels=False,
-            max_detections=1,
         )
         if len(detections.xyxy) > 0:
             xyxy = detections.xyxy[0]
@@ -115,10 +113,6 @@ def main():
         detections, _ = model.predict(
             image=image,
             caption=caption,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            return_labels=False,
-            max_detections=1,
         )
 
         _sync_cuda()
@@ -161,19 +155,6 @@ def main():
     rospy.loginfo("GDINO stats: %s", _stats(gdino_costs))
     rospy.loginfo("SAM stats:   %s", _stats(sam_costs))
     rospy.loginfo("TOTAL stats: %s", _stats(total_costs))
-
-    try:
-        with open(output_file, "a", encoding="utf-8") as f:
-            var = "_" + str(os.environ.get("GROUNDINGDINO_USE_AMP", "1"))
-            var = var + "_" + str(os.environ.get("GROUNDINGDINO_RESIZE_SHORT", "800"))
-            var = var + "_" + str(os.environ.get("GROUNDINGDINO_RESIZE_MAX", "1333"))
-            var = var + "_" + str(os.environ.get("MOBILESAM_USE_AMP", "1"))
-            var = var + f"_scale{resize_scale}_reuseSamEmb{int(reuse_sam_image_embedding)}_"
-            f.write(var + "\n")
-            for dt in total_costs:
-                f.write(f"deltatime_detection: {dt:.6f}\n")
-    except Exception as exc:
-        rospy.logwarn("write %s failed: %s", output_file, str(exc))
 
 
 if __name__ == "__main__":

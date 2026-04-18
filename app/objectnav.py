@@ -16,6 +16,8 @@ from std_msgs.msg import String
 
 from GroundingDINO.gdino import GroundingDINO
 from MobileSAM.sam import Sam
+from yoloe.yoloe import Yoloe
+
 
 import actionlib
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
@@ -33,9 +35,12 @@ class FusionLidarCameraNode:
         """Initialize model instances, ROS params, pubs/subs, and time synchronizer."""
         self.topic_image = rospy.get_param("~topic_image", "/camera/go2/front/image_raw")
         self.topic_visual_points = rospy.get_param("~topic_visual_points", "/visual_points/cam_front_lidar")
-        self.caption = rospy.get_param("~caption", "black box")
-        self.box_threshold = float(rospy.get_param("~box_threshold", 0.55))
-        self.text_threshold = float(rospy.get_param("~text_threshold", 0.85))
+        
+        # Detection parameters
+        caption = rospy.get_param("~caption", "black box")
+        box_threshold = float(rospy.get_param("~box_threshold", 0.55))
+        text_threshold = float(rospy.get_param("~text_threshold", 0.85))
+
         self.sync_slop = float(rospy.get_param("~sync_slop", 0.05))
         self.sync_queue_size = int(rospy.get_param("~sync_queue_size", 1))
         self.min_points = int(rospy.get_param("~min_points", 5))
@@ -56,7 +61,7 @@ class FusionLidarCameraNode:
         self.max_lidarimage_delay = float(rospy.get_param("~max_lidarimage_delay", 0.6))
         self.max_tolerate_delay = float(rospy.get_param("~max_tolerate_delay", 0.0))
         self.max_infer_fps = float(rospy.get_param("~max_infer_fps", 1.0))
-        self.enable_debug_overlay = bool(rospy.get_param("~enable_debug_overlay", False))
+        self.enable_debug_overlay = bool(rospy.get_param("~enable_debug_overlay", True))
         self.use_bbox_mask_only = bool(rospy.get_param("~use_bbox_mask_only", False))
         self.debug_max_points = int(rospy.get_param("~debug_max_points", 500))
         self.save_debug_images = bool(rospy.get_param("~save_debug_images", False))
@@ -70,8 +75,15 @@ class FusionLidarCameraNode:
         self.last_infer_stamp_sec = 0.0
         self.last_time = rospy.Time.now().to_sec()
         self.state_lock = threading.Lock()
-
-        self.gdino_model = GroundingDINO()
+        select = False
+        if select:
+            self.detecte_model = GroundingDINO()
+            self.detecte_model.setparameters(caption=caption, box_threshold=box_threshold, 
+                                        text_threshold=text_threshold,
+                                        return_labels=self.enable_debug_overlay)
+        else:
+            self.detecte_model = Yoloe("11l")
+        
         self.sam_model = Sam()
         self.tf_listener = tf.TransformListener()
         self.job_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
@@ -134,9 +146,10 @@ class FusionLidarCameraNode:
         now = rospy.Time.now()
         task = str(tmsg.get("task", "none")).lower()
         with self.state_lock:
-            self.caption = tmsg.get("caption", self.caption)
+            caption = tmsg.get("caption", self.detecte_model.caption)
             self.cmd_seq += 1
 
+            self.detecte_model.setparameters(caption=caption)
             if task == "follow":
                 self.run = FOLLOW
                 self.cmd_stamp = now
@@ -149,7 +162,6 @@ class FusionLidarCameraNode:
             else:
                 self.run = NOTASK
 
-            caption = self.caption
             run = self.run
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
@@ -663,17 +675,10 @@ class FusionLidarCameraNode:
 
         base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
         image = self.ros_image_to_cv2(image_msg)
-        need_debug = self.enable_debug_overlay and (
-            self.save_debug_images or self.pub_debug_image.get_num_connections() > 0
-        )
 
-        detections, labels = self.gdino_model.predict(
+        detections, labels = self.detecte_model.predict(
             image=image,
-            caption=caption,
-            box_threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            return_labels=need_debug,
-            max_detections=1,
+            caption=caption
         )
         if len(detections.xyxy) == 0:
             rospy.logwarn("No detections for caption='%s'", caption)
@@ -749,8 +754,8 @@ class FusionLidarCameraNode:
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
-        if need_debug:
-            annotated = self.gdino_model.annotate(image, detections, labels)
+        if self.enable_debug_overlay:
+            annotated = self.detecte_model.annotate(image, detections, labels)
             debug = annotated
             debug[mask] = (debug[mask] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4).astype(np.uint8)
 
@@ -759,7 +764,7 @@ class FusionLidarCameraNode:
             line3 = f"num_points={payload['num_points']}"
             line4 = f"gdino_score={payload['gdino_score']}"
             x, y0, dy = 20, 40, 30
-            font, scale, color, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
+            font, scale, color, thick  = cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
             cv2.putText(debug, line1, (x, y0 + 0 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line2, (x, y0 + 1 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line3, (x, y0 + 2 * dy), font, scale, color, thick, cv2.LINE_AA)
@@ -802,7 +807,7 @@ class FusionLidarCameraNode:
             run_mode = self.run
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
-            caption = self.caption
+            caption = self.detecte_model.caption
 
             if run_mode not in (RECON, FOLLOW):
                 return
