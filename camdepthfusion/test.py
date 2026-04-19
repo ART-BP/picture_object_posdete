@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
+import sys
 import traceback
-from typing import List
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -12,16 +14,34 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from sensor_msgs.msg import Image, PointCloud2, PointField
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from GroundingDINO.gdino import GroundingDINO
+from MobileSAM.sam import Sam
+
 
 # ---------------------- Hard-coded configuration ----------------------
 TOPIC_IMAGE = "/camera/go2/front/image_raw"
 TOPIC_LIDAR = "/lidar_points"
-TOPIC_PROJECTED_CLOUD = "/camdepthfusion/projected_cloud"
-TOPIC_PROJECTED_IMAGE = "/camdepthfusion/projected_image"
+TOPIC_PROJECTED_CLOUD = "/camdepthfusion/test/projected_cloud"
+TOPIC_OBJECT_CLOUD = "/camdepthfusion/test/object_cloud"
+TOPIC_DEBUG_IMAGE = "/camdepthfusion/test/debug_image"
 
 SYNC_QUEUE_SIZE = 2
 SYNC_SLOP = 0.05
+MAX_INFER_FPS = 0.0
+
+CAPTION = "white column"
+BOX_THRESHOLD = 0.55
+TEXT_THRESHOLD = 0.85
+MAX_DETECTIONS = 1
+
 MIN_DEPTH = 0.05
+MIN_OBJECT_POINTS = 10
+MASK_DILATE_PX = 2
+
 POINT_RADIUS = 2
 MAX_OVERLAY_POINTS = 8000
 
@@ -40,7 +60,6 @@ K = np.array(
     dtype=np.float64,
 ).reshape(3, 3)
 
-# Kept for compatibility with your calibration set (not used in undistorted projection).
 D = np.array(
     [
         -0.1269125424187082,
@@ -82,12 +101,12 @@ R = np.array(
     dtype=np.float64,
 ).reshape(3, 3)
 
-T = np.array([0.0, 0.03, 0.2], dtype=np.float64)
+T = np.array([0.0, 0.0, 0.2], dtype=np.float64)
 # ---------------------------------------------------------------------
 
 
 def _ros_image_to_cv2_fallback(ros_image: Image) -> np.ndarray:
-    """Decode sensor_msgs/Image to BGR without relying on cv_bridge runtime libs."""
+    """Decode ROS Image to BGR without relying on cv_bridge runtime libs."""
     h = int(ros_image.height)
     w = int(ros_image.width)
     step = int(ros_image.step)
@@ -133,8 +152,19 @@ def _ros_image_to_cv2_fallback(ros_image: Image) -> np.ndarray:
     return decoded
 
 
+def _cv2_to_ros_image_fallback(image_bgr: np.ndarray, header) -> Image:
+    msg = Image()
+    msg.header = header
+    msg.height = int(image_bgr.shape[0])
+    msg.width = int(image_bgr.shape[1])
+    msg.encoding = "bgr8"
+    msg.is_bigendian = False
+    msg.step = int(image_bgr.shape[1] * 3)
+    msg.data = np.ascontiguousarray(image_bgr, dtype=np.uint8).tobytes()
+    return msg
+
+
 def _read_xyz(cloud_msg: PointCloud2) -> np.ndarray:
-    """Vectorized PointCloud2 decode: return finite xyz in lidar frame."""
     field_map = {f.name: f for f in cloud_msg.fields}
     dtype_map = {
         PointField.INT8: "i1",
@@ -181,9 +211,7 @@ def _read_xyz(cloud_msg: PointCloud2) -> np.ndarray:
 
     expected_bytes = int(cloud_msg.row_step) * height
     if len(cloud_msg.data) < expected_bytes:
-        raise ValueError(
-            "PointCloud2 data too short: len(data)=%d expected>=%d" % (len(cloud_msg.data), expected_bytes)
-        )
+        raise ValueError("PointCloud2 data too short: len(data)=%d expected>=%d" % (len(cloud_msg.data), expected_bytes))
 
     points = np.ndarray(
         shape=(height, width),
@@ -200,22 +228,18 @@ def _read_xyz(cloud_msg: PointCloud2) -> np.ndarray:
     if not np.any(finite):
         return np.zeros((0, 3), dtype=np.float32)
 
-    # Keep raw lidar coordinates for published xyz.
-    xyz = np.stack((x[finite], y[finite], z[finite]), axis=1).astype(np.float32, copy=False)
-    return xyz
+    return np.stack((x[finite], y[finite], z[finite]), axis=1).astype(np.float32, copy=False)
 
 
 def project_lidar_to_image(
     xyz_lidar: np.ndarray,
-    R_optical_lidar: np.ndarray,
+    r_optical_lidar: np.ndarray,
     t_optical_lidar: np.ndarray,
-    K_camera: np.ndarray,
+    k_camera: np.ndarray,
     width: int,
     height: int,
-    dist_coeffs: np.ndarray,
     min_depth: float,
-):
-    """Map lidar points to image pixels on undistorted image."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if xyz_lidar.size == 0:
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -223,7 +247,7 @@ def project_lidar_to_image(
             np.zeros((0,), dtype=np.float32),
         )
 
-    xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
+    xyz_cam = (r_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
     valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
     if not np.any(valid):
         return (
@@ -235,9 +259,7 @@ def project_lidar_to_image(
     xyz_lidar_valid = xyz_lidar[valid]
     xyz_cam = xyz_cam[valid]
 
-    # Keep D for compatibility; projection assumes undistorted image.
-    _ = dist_coeffs
-    uvw = (K_camera @ xyz_cam.T).T
+    uvw = (k_camera @ xyz_cam.T).T
     uv = uvw[:, :2] / uvw[:, 2:3]
 
     inside = (
@@ -259,7 +281,7 @@ def project_lidar_to_image(
     return xyz_inside, uv_inside, depth_inside
 
 
-def _build_projected_cloud_msg(header, xyz_lidar: np.ndarray, uv: np.ndarray) -> PointCloud2:
+def _build_cloud_xyzuv(header, xyz: np.ndarray, uv: np.ndarray) -> PointCloud2:
     fields = [
         PointField("x", 0, PointField.FLOAT32, 1),
         PointField("y", 4, PointField.FLOAT32, 1),
@@ -267,11 +289,20 @@ def _build_projected_cloud_msg(header, xyz_lidar: np.ndarray, uv: np.ndarray) ->
         PointField("u", 12, PointField.FLOAT32, 1),
         PointField("v", 16, PointField.FLOAT32, 1),
     ]
-    points = np.concatenate([xyz_lidar, uv], axis=1).astype(np.float32)
+    points = np.concatenate([xyz, uv], axis=1).astype(np.float32)
     return pc2.create_cloud(header, fields, points)
 
 
-def _draw_overlay(image_bgr: np.ndarray, uv: np.ndarray, depth: np.ndarray) -> np.ndarray:
+def _build_cloud_xyz(header, xyz: np.ndarray) -> PointCloud2:
+    fields = [
+        PointField("x", 0, PointField.FLOAT32, 1),
+        PointField("y", 4, PointField.FLOAT32, 1),
+        PointField("z", 8, PointField.FLOAT32, 1),
+    ]
+    return pc2.create_cloud(header, fields, xyz.astype(np.float32).tolist())
+
+
+def _draw_depth_overlay(image_bgr: np.ndarray, uv: np.ndarray, depth: np.ndarray) -> np.ndarray:
     overlay = image_bgr.copy()
     count = int(uv.shape[0])
     if count <= 0:
@@ -299,11 +330,24 @@ def _draw_overlay(image_bgr: np.ndarray, uv: np.ndarray, depth: np.ndarray) -> n
     return overlay
 
 
-class ProjectLidarNode:
-    def __init__(self):
+class LidarImageTester:
+    def __init__(self) -> None:
         self.bridge = CvBridge()
+        self.last_infer_sec = 0.0
+
+        self.gdino = GroundingDINO()
+        self.gdino.setparameters(
+            caption=CAPTION,
+            box_threshold=BOX_THRESHOLD,
+            text_threshold=TEXT_THRESHOLD,
+            return_labels=True,
+            max_detections=MAX_DETECTIONS,
+        )
+        self.sam = Sam()
+
         self.pub_projected_cloud = rospy.Publisher(TOPIC_PROJECTED_CLOUD, PointCloud2, queue_size=1)
-        self.pub_projected_image = rospy.Publisher(TOPIC_PROJECTED_IMAGE, Image, queue_size=1)
+        self.pub_object_cloud = rospy.Publisher(TOPIC_OBJECT_CLOUD, PointCloud2, queue_size=1)
+        self.pub_debug_image = rospy.Publisher(TOPIC_DEBUG_IMAGE, Image, queue_size=1)
 
         self.sub_image = Subscriber(TOPIC_IMAGE, Image)
         self.sub_lidar = Subscriber(TOPIC_LIDAR, PointCloud2)
@@ -315,65 +359,137 @@ class ProjectLidarNode:
         self.sync.registerCallback(self.synced_callback)
 
         rospy.loginfo(
-            "[project_lidar] ready: image=%s lidar=%s out_cloud=%s out_image=%s",
+            "test node ready: image=%s lidar=%s projected=%s object=%s debug=%s caption=%s",
             TOPIC_IMAGE,
             TOPIC_LIDAR,
             TOPIC_PROJECTED_CLOUD,
-            TOPIC_PROJECTED_IMAGE,
+            TOPIC_OBJECT_CLOUD,
+            TOPIC_DEBUG_IMAGE,
+            CAPTION,
         )
+        rospy.loginfo("AXIS_REMAP(row-major)=%s det=%.3f", AXIS_REMAP.reshape(-1).tolist(), float(np.linalg.det(AXIS_REMAP)))
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         try:
+            now_sec = rospy.Time.now().to_sec()
+            if MAX_INFER_FPS > 0.0:
+                min_dt = 1.0 / MAX_INFER_FPS
+                if self.last_infer_sec > 0.0 and (now_sec - self.last_infer_sec) < min_dt:
+                    return
+                self.last_infer_sec = now_sec
+
             try:
                 image_bgr = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
             except Exception:
                 image_bgr = _ros_image_to_cv2_fallback(image_msg)
 
-            xyz_lidar = _read_xyz(cloud_msg)
-            if xyz_lidar.shape[0] <= 0:
+            xyz_raw = _read_xyz(cloud_msg)
+            if xyz_raw.shape[0] == 0:
                 return
 
+            # Publish and project with axis-remapped lidar coordinates.
+            xyz_lidar = (AXIS_REMAP @ xyz_raw.T).T
             h, w = image_bgr.shape[:2]
-            # Apply axis remap only in projection chain, not in published xyz.
-            R_for_projection = R @ AXIS_REMAP
             xyz_inside, uv_inside, depth_inside = project_lidar_to_image(
                 xyz_lidar=xyz_lidar,
-                R_optical_lidar=R_for_projection,
+                r_optical_lidar=R,
                 t_optical_lidar=T,
-                K_camera=K,
+                k_camera=K,
                 width=w,
                 height=h,
-                dist_coeffs=D,
                 min_depth=MIN_DEPTH,
             )
-            if xyz_inside.shape[0] <= 0:
+
+            projected_cloud = _build_cloud_xyzuv(cloud_msg.header, xyz_inside, uv_inside)
+            self.pub_projected_cloud.publish(projected_cloud)
+
+            if xyz_inside.shape[0] == 0:
+                empty_object = np.zeros((0, 3), dtype=np.float32)
+                self.pub_object_cloud.publish(_build_cloud_xyz(cloud_msg.header, empty_object))
                 return
 
-            projected_cloud_msg = _build_projected_cloud_msg(cloud_msg.header, xyz_inside, uv_inside)
-            self.pub_projected_cloud.publish(projected_cloud_msg)
+            detections, labels = self.gdino.predict(image=image_bgr, caption=CAPTION)
+            if detections is None or len(detections.xyxy) == 0:
+                empty_object = np.zeros((0, 3), dtype=np.float32)
+                self.pub_object_cloud.publish(_build_cloud_xyz(cloud_msg.header, empty_object))
+                return
 
-            overlay = _draw_overlay(image_bgr=image_bgr, uv=uv_inside, depth=depth_inside)
+            conf = (
+                np.asarray(detections.confidence, dtype=np.float32)
+                if getattr(detections, "confidence", None) is not None
+                else np.zeros((len(detections.xyxy),), dtype=np.float32)
+            )
+            best_idx = int(np.argmax(conf))
+            box_xyxy = detections.xyxy[best_idx]
+            label = labels[best_idx] if labels is not None and best_idx < len(labels) else CAPTION
+            score = float(conf[best_idx]) if best_idx < len(conf) else 0.0
+
+            mask, _, _ = self.sam.get_mask_by_box(
+                box_xyxy=box_xyxy,
+                image=image_bgr,
+                image_format="BGR",
+                multimask_output=False,
+            )
+
+            if MASK_DILATE_PX > 0:
+                k = MASK_DILATE_PX * 2 + 1
+                kernel = np.ones((k, k), dtype=np.uint8)
+                mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+
+            u_inside = np.rint(uv_inside[:, 0]).astype(np.int32)
+            v_inside = np.rint(uv_inside[:, 1]).astype(np.int32)
+            valid_pix = (u_inside >= 0) & (u_inside < w) & (v_inside >= 0) & (v_inside < h)
+            on_object = np.zeros((uv_inside.shape[0],), dtype=bool)
+            on_object[valid_pix] = mask[v_inside[valid_pix], u_inside[valid_pix]]
+
+            object_xyz = xyz_inside[on_object]
+            if object_xyz.shape[0] < MIN_OBJECT_POINTS:
+                object_xyz = np.zeros((0, 3), dtype=np.float32)
+
+            self.pub_object_cloud.publish(_build_cloud_xyz(cloud_msg.header, object_xyz))
+
+            debug = _draw_depth_overlay(image_bgr, uv_inside, depth_inside)
+            if mask is not None:
+                debug[mask] = (debug[mask] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4).astype(np.uint8)
+
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box_xyxy]
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+            text = "%s %.2f obj_pts=%d in_img=%d" % (label, score, int(object_xyz.shape[0]), int(xyz_inside.shape[0]))
+            cv2.putText(debug, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+            sample_uv = np.stack((u_inside[on_object], v_inside[on_object]), axis=1) if np.any(on_object) else np.zeros((0, 2), dtype=np.int32)
+            if sample_uv.shape[0] > 0:
+                step = max(1, sample_uv.shape[0] // 300)
+                for uu, vv in sample_uv[::step]:
+                    cv2.circle(debug, (int(uu), int(vv)), 1, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+
             try:
-                overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
+                debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")
             except Exception:
-                overlay_msg = Image()
-                overlay_msg.height = int(overlay.shape[0])
-                overlay_msg.width = int(overlay.shape[1])
-                overlay_msg.encoding = "bgr8"
-                overlay_msg.is_bigendian = False
-                overlay_msg.step = int(overlay.shape[1] * 3)
-                overlay_msg.data = np.ascontiguousarray(overlay, dtype=np.uint8).tobytes()
+                debug_msg = _cv2_to_ros_image_fallback(debug, image_msg.header)
+            debug_msg.header = image_msg.header
+            self.pub_debug_image.publish(debug_msg)
 
-            overlay_msg.header = image_msg.header
-            self.pub_projected_image.publish(overlay_msg)
+            rospy.loginfo_throttle(
+                1.0,
+                "test: projected=%d object=%d caption='%s'",
+                int(xyz_inside.shape[0]),
+                int(object_xyz.shape[0]),
+                CAPTION,
+            )
         except Exception as exc:
-            rospy.logerr_throttle(2.0, "[project_lidar] callback failed: %s", str(exc))
-            rospy.logerr_throttle(2.0, "[project_lidar] traceback:\n%s", traceback.format_exc())
+            rospy.logerr_throttle(2.0, "test callback failed: %s", str(exc))
+            rospy.logerr_throttle(2.0, "traceback:\n%s", traceback.format_exc())
 
 
-def main():
-    rospy.init_node("project_lidar")
-    ProjectLidarNode()
+def main() -> None:
+    rospy.init_node("lidar_image_test_node")
+    LidarImageTester()
     rospy.spin()
 
 
