@@ -102,14 +102,18 @@ class Yoloe:
             refer_image=target_image,
             visual_prompts=visual_prompts,
             predictor=YOLOEVPSegPredictor,
-            conf=0.25,
+            conf=0.45,
             save=True,
             project="yoloe/output",
             name="vp_demo",
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         detections = sv.Detections.from_ultralytics(results[0])
-        return detections
+        if self.return_labels:
+            labels = [
+            f"{class_name} {confidence:.2f}"
+            for class_name, confidence in zip(detections["class_name"], detections.confidence)]
+        return detections, labels
     
     @staticmethod
     def read_image(image_path: PathLike) -> np.ndarray:

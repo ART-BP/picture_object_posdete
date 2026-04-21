@@ -99,9 +99,9 @@ def predict(
     )
     if use_amp:
         try:
-            autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+            autocast_ctx = torch.amp.autocast("cuda", dtype=torch.float16)
         except Exception:
-            autocast_ctx = torch.cuda.amp.autocast(enabled=True)
+            autocast_ctx = torch.amp.autocast("cuda", enabled=True)
     else:
         autocast_ctx = contextlib.nullcontext()
     with torch.inference_mode():

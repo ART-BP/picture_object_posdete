@@ -60,9 +60,9 @@ class Sam:
         if not self.use_amp:
             return contextlib.nullcontext()
         try:
-            return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+            return torch.amp.autocast("cuda", dtype=torch.float16)
         except Exception:
-            return torch.cuda.amp.autocast(enabled=True)
+            return torch.amp.autocast("cuda", enabled=True)
 
     @staticmethod
     def _read_image(image: Union[PathLike, ArrayLike], image_format: str = "BGR") -> ArrayLike:
