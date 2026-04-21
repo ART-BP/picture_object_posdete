@@ -1,0 +1,125 @@
+rational_polynomial:
+  camera_name: go2_front_rational
+  camera_matrix:
+    rows: 3
+    cols: 3
+    data:
+    - 1335.864460386936
+    - 0.0
+    - 968.8817902412135
+    - 0.0
+    - 1328.2832716149142
+    - 522.6824932300386
+    - 0.0
+    - 0.0
+    - 1.0
+  distortion_model: rational_polynomial
+  distortion_coefficients:
+    rows: 1
+    cols: 8
+    data:
+    - 0.32646411607826503
+    - -1.9188957740895327
+    - 0.001982715074362484
+    - -0.00027570679873816954
+    - -2.926917582123901
+    - 0.6514928387415442
+    - -1.0590538723452347
+    - -5.409316087937021
+  projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 950.8156904360609
+  - 0.0
+  - 971.6342492798834
+  - 0.0
+  - 0.0
+  - 1069.9851954947992
+  - 524.4678559817229
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0 
+
+fisheye:
+  camera_name: go2_front_fisheye
+  camera_matrix:
+    rows: 3
+    cols: 3
+    data:
+    - 1203.762044004368
+    - 0.0
+    - 981.7904792654031
+    - 0.0
+    - 1203.7009720218682
+    - 525.2625697472332
+    - 0.0
+    - 0.0
+    - 1.0
+  distortion_model: fisheye
+  distortion_coefficients:
+    rows: 1
+    cols: 4
+    data:
+    - -0.06940178268945467
+    - -0.05259276838826166
+    - 0.060392401913685174
+    - -0.03652503468416535
+  rectification_matrix:
+    rows: 3
+    cols: 3
+    data:
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  projection_matrix:
+    rows: 3
+    cols: 4
+    data:
+    - 824.000458318671
+    - 0.0
+    - 990.3299740527029
+    - 0.0
+    - 0.0
+    - 823.9586532610845
+    - 526.1425913864505
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0
+
+
+rational_polynomial_orinal:
+  camera_name: go2_front_fisheye
+  camera_matrix:
+    rows: 3
+    cols: 3
+    data:
+    - 1166.271789008082
+    - 0.0
+    - 959.0530108632893
+    - 0.0
+    - 1167.7222552768242
+    - 544.1763261328632
+    - 0.0
+    - 0.0
+    - 1.0
+  distortion_model: rational_polynomial_orinal
+  distortion_coefficients:
+    rows: 1
+    cols: 5
+    data:
+    - -0.1269125424187082
+    - 0.08472977776858055
+    - 0.36834095572628567
+    - -0.27857771753696225
+    - 0.0
