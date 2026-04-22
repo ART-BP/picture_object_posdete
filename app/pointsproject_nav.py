@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 from enum import IntEnum
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -30,6 +30,7 @@ from tf.transformations import quaternion_from_euler
 from camdepthfusion import points_project
 from camdepthfusion import cloudpoints_handle
 from camdepthfusion import camera_handle
+from recovery import RecoveryAction, RecoveryController
 
 
 class TaskState(IntEnum):
@@ -121,6 +122,12 @@ class FusionLidarCameraNode:
         self.debug_max_points = self._cfg_get(cfg, "debug_max_points", 500, int)
         self.save_debug_images = self._cfg_get(cfg, "save_debug_images", False, bool)
         self.output_dir = self._cfg_get(cfg, "output_dir", default_output_dir, str)
+        self.recovery_move_after_s = self._cfg_get(cfg, "recovery_move_after_s", 3.0, float)
+        self.recovery_rotate_after_s = self._cfg_get(cfg, "recovery_rotate_after_s", 5.0, float)
+        self.recovery_cancel_after_s = self._cfg_get(cfg, "recovery_cancel_after_s", 10.0, float)
+        self.recovery_forward_dist_m = self._cfg_get(cfg, "recovery_forward_dist_m", 2.0, float)
+        self.recovery_rotate_deg = self._cfg_get(cfg, "recovery_rotate_deg", 90.0, float)
+        self.recovery_tick_hz = self._cfg_get(cfg, "recovery_tick_hz", 10.0, float)
         
         self.run = TaskState.Notask
         self.cmd_stamp = rospy.Time(0)
@@ -128,6 +135,11 @@ class FusionLidarCameraNode:
         self.last_infer_stamp_sec = 0.0
         self.last_time = rospy.Time.now().to_sec()
         self.state_lock = threading.Lock()
+        self.recovery = RecoveryController(
+            move_after_sec=self.recovery_move_after_s,
+            rotate_after_sec=self.recovery_rotate_after_s,
+            cancel_after_sec=self.recovery_cancel_after_s,
+        )
 
 
         select = self._cfg_get(cfg, "model", "gdino", str).strip().lower()
@@ -146,8 +158,14 @@ class FusionLidarCameraNode:
         self.tf_listener = tf.TransformListener()
         self.job_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
-        self.worker_thread = threading.Thread(target=self._worker_loop, name="fusion_worker", daemon=True)
-        self.worker_thread.start()
+        self.worker_lock = threading.Lock()
+        self.worker_thread: Optional[threading.Thread] = None
+        self.recovery_thread = threading.Thread(
+            target=self._recovery_loop,
+            name="fusion_recovery",
+            daemon=True,
+        )
+        self.recovery_thread.start()
 
         self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/debug_image", Image, queue_size=1, latch=True)
         self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
@@ -204,6 +222,7 @@ class FusionLidarCameraNode:
             return
 
         now = rospy.Time.now()
+        now_sec = now.to_sec()
         task = str(tmsg.get("task", "none")).lower()
         with self.state_lock:
             caption = tmsg.get("caption", self.detecte_model.caption)
@@ -225,11 +244,16 @@ class FusionLidarCameraNode:
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
 
+        self.recovery.on_task(task=task, now_sec=now_sec)
+
+        if task in ("follow", "recognition", "follow_once"):
+            self._ensure_worker_started()
+
         if task == "cancel":
             self.client.cancel_goal()
             self._clear_pending_jobs()
 
-        self.last_time = now.to_sec()
+        self.last_time = now_sec
         rospy.loginfo(
             "Received cmd: caption=%s task=%s  cmd_stamp=%.6f cmd_seq=%d",
             caption,
@@ -238,16 +262,118 @@ class FusionLidarCameraNode:
             cmd_seq,
         )
 
+    def _ensure_worker_started(self) -> None:
+        """Start worker lazily after receiving a valid task command."""
+        with self.worker_lock:
+            if self.stop_event.is_set():
+                return
+            if self.worker_thread is not None and self.worker_thread.is_alive():
+                return
+            self.worker_thread = threading.Thread(
+                target=self._worker_loop,
+                name="fusion_worker",
+                daemon=True,
+            )
+            self.worker_thread.start()
+
+    def _recovery_loop(self) -> None:
+        tick_hz = max(1.0, float(self.recovery_tick_hz))
+        sleep_dt = 1.0 / tick_hz
+        while not rospy.is_shutdown() and not self.stop_event.is_set():
+            event = self.recovery.poll(now_sec=rospy.Time.now().to_sec())
+            if event is not None:
+                self._handle_recovery_event(event)
+            self.stop_event.wait(sleep_dt)
+
+    def _lookup_base_pose(self) -> Optional[Tuple[Tuple[float, float, float], float]]:
+        try:
+            self.tf_listener.waitForTransform(
+                self.goal_frame,
+                self.base_frame,
+                rospy.Time(0),
+                rospy.Duration(self.tf_timeout_s),
+            )
+            trans, rot = self.tf_listener.lookupTransform(
+                self.goal_frame,
+                self.base_frame,
+                rospy.Time(0),
+            )
+            base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
+            return (float(trans[0]), float(trans[1]), float(trans[2])), base_yaw
+        except Exception as exc:
+            rospy.logwarn_throttle(1.0, "recovery TF lookup failed: %s", str(exc))
+            return None
+
+    def _send_recovery_forward_goal(self, heading_rad: float) -> None:
+        pose = self._lookup_base_pose()
+        if pose is None:
+            return
+        base_trans, base_yaw = pose
+        yaw_map = base_yaw + float(heading_rad)
+        goal_x = float(base_trans[0] + self.recovery_forward_dist_m * math.cos(yaw_map))
+        goal_y = float(base_trans[1] + self.recovery_forward_dist_m * math.sin(yaw_map))
+        q = quaternion_from_euler(0.0, 0.0, yaw_map)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.goal_frame
+        goal.target_pose.pose.position.x = goal_x
+        goal.target_pose.pose.position.y = goal_y
+        goal.target_pose.pose.position.z = 0.0
+        goal.target_pose.pose.orientation = Quaternion(*q)
+        self.client.send_goal(goal)
+
+    def _send_recovery_rotate_goal(self, heading_rad: float) -> None:
+        pose = self._lookup_base_pose()
+        if pose is None:
+            return
+        base_trans, base_yaw = pose
+        turn_sign = 1.0 if float(heading_rad) >= 0.0 else -1.0
+        yaw_map = base_yaw + turn_sign * math.radians(float(self.recovery_rotate_deg))
+        q = quaternion_from_euler(0.0, 0.0, yaw_map)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.goal_frame
+        goal.target_pose.pose.position.x = float(base_trans[0])
+        goal.target_pose.pose.position.y = float(base_trans[1])
+        goal.target_pose.pose.position.z = 0.0
+        goal.target_pose.pose.orientation = Quaternion(*q)
+        self.client.send_goal(goal)
+
+    def _handle_recovery_event(self, event) -> None:
+        if event.action == RecoveryAction.MOVE_LAST_DIRECTION:
+            self._send_recovery_forward_goal(event.heading_rad)
+            rospy.logwarn("recovery move triggered: lost=%.2fs", event.lost_sec)
+            return
+
+        if event.action == RecoveryAction.ROTATE_IN_PLACE:
+            self._send_recovery_rotate_goal(event.heading_rad)
+            rospy.logwarn("recovery rotate triggered: lost=%.2fs", event.lost_sec)
+            return
+
+        if event.action == RecoveryAction.CANCEL_TASK:
+            with self.state_lock:
+                self.run = TaskState.Notask
+                self.cmd_stamp = rospy.Time(0)
+                self.cmd_seq += 1
+            self.client.cancel_goal()
+            self._clear_pending_jobs()
+            rospy.logwarn("recovery cancel triggered: lost=%.2fs", event.lost_sec)
+
     def _on_shutdown(self) -> None:
         """Stop worker thread quickly during node shutdown."""
         self.stop_event.set()
         self._clear_pending_jobs()
-        try:
-            self.job_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=0.5)
+        if self.recovery_thread.is_alive():
+            self.recovery_thread.join(timeout=0.5)
+        worker = self.worker_thread
+        if worker is not None and worker.is_alive():
+            try:
+                self.job_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join(timeout=0.5)
 
     def _clear_pending_jobs(self) -> None:
         """Drop all queued jobs so outdated frames are not processed."""
@@ -318,6 +444,7 @@ class FusionLidarCameraNode:
         goal_map_y = float(base_trans[1] + sin_yaw * goal_x + cos_yaw * goal_y)
         yaw_map = base_yaw + yaw_center
 
+        self.recovery.on_detection(goal_map_x, goal_map_y, rospy.Time.now().to_sec())
         q = quaternion_from_euler(0.0, 0.0, yaw_map)
 
         goal = MoveBaseGoal()
@@ -536,7 +663,7 @@ class FusionLidarCameraNode:
             return
         
         h, w = image.shape[:2]
-        xyz_proj, uv, depth = points_project.project_lidar_to_image_with_rational_polynomial(
+        xyz_proj, uv, _ = points_project.project_lidar_to_image_with_rational_polynomial(
             xyz_lidar=xyz,
             R_optical_lidar=points_project.R,
             t_optical_lidar=points_project.T,
@@ -591,6 +718,10 @@ class FusionLidarCameraNode:
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
+        if self.run == TaskState.Recognize:
+            self.run = TaskState.Notask
+            return
+        
         if self.enable_debug_overlay:
             annotated = self.detecte_model.annotate(image, detections, labels)
             debug = annotated
@@ -656,7 +787,7 @@ class FusionLidarCameraNode:
                     return
                 self.last_infer_stamp_sec = frame_stamp_sec
 
-            if run_mode == TaskState.Recognize or run_mode == TaskState.Follow_once:
+            if  run_mode == TaskState.Follow_once:
                 self.run = TaskState.Notask
 
         job = {
