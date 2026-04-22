@@ -84,6 +84,10 @@ class FusionLidarCameraNode:
             "output_fusion",
         )
 
+        params = camera_handle.load_camera_params_from_yaml(camera_model="rational_polynomial")  # For logging camera params and compatibility check
+        self.K = np.asarray(params["K"],dtype=np.float64)
+        self.D = np.asarray(params["D"],dtype=np.float64)
+
         self.topic_image = self._cfg_get(cfg, "topic_image", "/camera/go2/front/image_raw", str)
         self.topic_visual_points = self._cfg_get(cfg, "topic_visual_points", "/visual_points/cam_front_lidar", str)
         self.topic_points = self._cfg_get(cfg, "topic_points", "/lidar_points", str)
@@ -152,8 +156,9 @@ class FusionLidarCameraNode:
         #  注册雷达和图像同步
         sub_image = Subscriber(self.topic_image, Image)
         sub_visual_points = Subscriber(self.topic_visual_points, PointCloud2)
+        sub_points = Subscriber(self.topic_points, PointCloud2)
         self.sync = ApproximateTimeSynchronizer(
-            fs=[sub_image, sub_visual_points],
+            fs=[sub_image, sub_points],
             queue_size=max(1, sync_queue_size),
             slop=sync_slop,
         )
@@ -180,8 +185,8 @@ class FusionLidarCameraNode:
             "debug=%s, bbox_mask_only=%s, max_lidarimage_delay=%.3f, max_tolerate_delay=%.3f, model_id=%s",
             self.topic_image,
             self.topic_visual_points,
-            max(1, self.sync_queue_size),
-            self.sync_slop,
+            max(1, sync_queue_size),
+            sync_slop,
             self.max_infer_fps,
             str(self.enable_debug_overlay),
             str(self.use_bbox_mask_only),
@@ -525,17 +530,31 @@ class FusionLidarCameraNode:
             kernel = np.ones((k, k), dtype=np.uint8)
             mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
-        xyzuv_inside = cloudpoints_handle._read_xyzuv(cloud_msg)
-        if xyzuv_inside.shape[0] == 0:
+        xyz = cloudpoints_handle._read_xyz(cloud_msg)
+        if xyz.shape[0] == 0:
             rospy.logwarn("No points from %s", self.topic_visual_points)
             return
-
-        u_inside = np.rint(xyzuv_inside[:, 3]).astype(np.int16)
-        v_inside = np.rint(xyzuv_inside[:, 4]).astype(np.int16)
+        
+        h, w = image.shape[:2]
+        xyz_proj, uv, depth = points_project.project_lidar_to_image_with_rational_polynomial(
+            xyz_lidar=xyz,
+            R_optical_lidar=points_project.R,
+            t_optical_lidar=points_project.T,
+            K_camera=self.K,
+            width=w,
+            height=h,
+            dist_coeffs=self.D,
+            min_depth=0.1,
+        )
+        if xyz_proj.shape[0] == 0:
+            rospy.logwarn_throttle(2.0, "no projected points inside image")
+            return
+        
+        u_inside = np.rint(uv[:, 0]).astype(np.int16)
+        v_inside = np.rint(uv[:, 1]).astype(np.int16)
 
         on_object = mask[u_inside, v_inside]
-        object_xyzuv = xyzuv_inside[on_object]
-        object_xyz = object_xyzuv[:, :3] if object_xyzuv.shape[0] > 0 else np.zeros((0, 3), dtype=np.float32)
+        object_xyz = xyz_proj[on_object]
 
         if object_xyz.shape[0] < self.min_points:
             rospy.logwarn(
@@ -625,7 +644,7 @@ class FusionLidarCameraNode:
             cmd_seq = self.cmd_seq
             caption = self.detecte_model.caption
 
-            if run_mode not in (TaskState.Follow_once, TaskState.Follow):
+            if run_mode not in (TaskState.Follow_once, TaskState.Follow, TaskState.Recognize):
                 return
 
             if cmd_stamp != rospy.Time(0) and frame_stamp != rospy.Time(0) and frame_stamp < cmd_stamp:
