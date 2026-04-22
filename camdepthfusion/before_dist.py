@@ -8,7 +8,7 @@ from sensor_msgs.msg import Image, PointCloud2
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 import camera_handle
-from cloudpoints_handle import CloudPointsHandle
+import cloudpoints_handle
 import points_project
 
 
@@ -122,7 +122,7 @@ class LidarImageBeforeDistTester:
             return
 
         try:
-            xyz_lidar = CloudPointsHandle._read_xyz(cloud_msg)
+            xyz_lidar = cloudpoints_handle._read_xyz(cloud_msg)
         except Exception as exc:
             rospy.logwarn_throttle(2.0, "cloud decode failed: %s", str(exc))
             return
@@ -158,7 +158,7 @@ class LidarImageBeforeDistTester:
             return
 
         try:
-            projected_cloud = CloudPointsHandle._build_cloud_xyzuv(cloud_msg.header, xyz_proj, uv)
+            projected_cloud = cloudpoints_handle._build_cloud_xyzuv(cloud_msg.header, xyz_proj, uv)
             self.pub_projected_cloud.publish(projected_cloud)
         except Exception as exc:
             rospy.logwarn_throttle(2.0, "build/publish projected cloud failed: %s", str(exc))

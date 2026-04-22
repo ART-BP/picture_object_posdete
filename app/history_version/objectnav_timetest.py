@@ -4,24 +4,31 @@ import math
 import os
 import queue
 import threading
+import time
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 import rospy
-import sensor_msgs.point_cloud2 as pc2
+
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import String
 
 from GroundingDINO.gdino import GroundingDINO
 from MobileSAM.sam import Sam
+from yoloe.yoloe import Yoloe
+
 
 import actionlib
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from geometry_msgs.msg import Quaternion
 import tf
 from tf.transformations import quaternion_from_euler
+
+from camdepthfusion import points_project
+from camdepthfusion import cloudpoints_handle
+from camdepthfusion import camera_handle
 
 NOTASK = 0
 FOLLOW = 1
@@ -47,12 +54,13 @@ class FusionLidarCameraNode:
         self.v_field = rospy.get_param("~v_field", "v")
         self.cluster_grid_size = float(rospy.get_param("~cluster_grid_size", 0.2))
 
-        self.cluster_dense_threshold = int(rospy.get_param("~cluster_dense_threshold", 500))
+        self.cluster_dense_threshold = int(rospy.get_param("~cluster_dense_threshold", 100))
         self.cluster_min_cell_sparse = int(rospy.get_param("~cluster_min_cell_sparse", 2))
         self.cluster_min_points_sparse = int(rospy.get_param("~cluster_min_points_sparse", 5))
         self.cluster_min_cell_dense = int(rospy.get_param("~cluster_min_cell_dense", 5))
         self.cluster_min_points_dense = int(rospy.get_param("~cluster_min_points_dense", 10))
-        self.min_goal_dist_m = float(rospy.get_param("~min_goal_dist_m", 0.4))
+        
+        self.min_goal_dist_m = float(rospy.get_param("~min_goal_dist_m", 0.5))
         self.goal_frame = rospy.get_param("~goal_frame", "map")
         self.base_frame = rospy.get_param("~base_frame", "base_link")
         self.tf_timeout_s = float(rospy.get_param("~tf_timeout_s", 0.03))
@@ -74,11 +82,17 @@ class FusionLidarCameraNode:
         self.last_time = rospy.Time.now().to_sec()
         self.state_lock = threading.Lock()
 
-        self.gdino_model = GroundingDINO()
-        self.gdino_model.setparameters(caption=caption, box_threshold=box_threshold, 
-                                       text_threshold=text_threshold,
-                                       return_labels=self.enable_debug_overlay)
-        
+        select = rospy.get_param("~model", "gdino")
+        if select == "gdino":
+            self.detecte_model = GroundingDINO()
+            self.detecte_model.setparameters(caption=caption, box_threshold=box_threshold, 
+                                        text_threshold=text_threshold,
+                                        return_labels=self.enable_debug_overlay)
+        else:
+            model = select[-3:]
+            self.detecte_model = Yoloe(model)
+            self.detecte_model.setparameters(caption=caption, threshold=box_threshold)
+
         self.sam_model = Sam()
         self.tf_listener = tf.TransformListener()
         self.job_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
@@ -118,7 +132,7 @@ class FusionLidarCameraNode:
 
         rospy.loginfo(
             "fusionLidarCamera ready: image=%s, points=%s, sync_queue=%d, sync_slop=%.3f, max_infer_fps=%.2f, "
-            "debug=%s, bbox_mask_only=%s, max_lidarimage_delay=%.3f, max_tolerate_delay=%.3f",
+            "debug=%s, bbox_mask_only=%s, max_lidarimage_delay=%.3f, max_tolerate_delay=%.3f, model_id=%s",
             self.topic_image,
             self.topic_visual_points,
             max(1, self.sync_queue_size),
@@ -128,6 +142,7 @@ class FusionLidarCameraNode:
             str(self.use_bbox_mask_only),
             self.max_lidarimage_delay,
             self.max_tolerate_delay,
+            self.detecte_model.name
         )
 
     def cmd_callback(self, msg: String) -> None:
@@ -141,10 +156,10 @@ class FusionLidarCameraNode:
         now = rospy.Time.now()
         task = str(tmsg.get("task", "none")).lower()
         with self.state_lock:
-            caption = tmsg.get("caption", self.gdino_model.caption)
+            caption = tmsg.get("caption", self.detecte_model.caption)
             self.cmd_seq += 1
 
-            self.gdino_model.setparameters(caption=caption)
+            self.detecte_model.setparameters(caption=caption)
             if task == "follow":
                 self.run = FOLLOW
                 self.cmd_stamp = now
@@ -282,247 +297,12 @@ class FusionLidarCameraNode:
             yaw_map,
         )
 
-
-    def cluster_2d_center_nearest_surface(
-        self,
-        points_xy: np.ndarray,
-        grid_size: float = 0.1,
-        min_points_per_cell: int = 2,
-        min_cluster_points: int = 5,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Cluster 2D points and return (median center, nearest surface point)."""
-        if points_xy is None:
-            nan_xy = np.array([np.nan, np.nan], dtype=np.float32)
-            return nan_xy, nan_xy.copy()
-
-        pts = np.asarray(points_xy, dtype=np.float32)
-        if pts.ndim != 2 or pts.shape[1] < 2:
-            raise ValueError(f"Expected Nx2 points, got shape={pts.shape}")
-        if pts.shape[1] > 2:
-            pts = pts[:, :2]
-        if pts.shape[0] == 0:
-            nan_xy = np.array([np.nan, np.nan], dtype=np.float32)
-            return nan_xy, nan_xy.copy()
-
-        if grid_size <= 0:
-            raise ValueError(f"grid_size must be > 0, got {grid_size}")
-
-        cell_points = np.floor(pts / float(grid_size)).astype(np.int32)
-        unique_cells, counts = np.unique(cell_points, axis=0, return_counts=True)
-
-        dense_mask = counts >= max(1, int(min_points_per_cell))
-        if not np.any(dense_mask):
-            center = np.median(pts, axis=0).astype(np.float32)
-            # Same ordering as norm(), but avoids sqrt for better speed.
-            nearest_idx = int(np.argmin(np.sum(pts * pts, axis=1)))
-            nearest_xy = pts[nearest_idx].astype(np.float32)
-            return center, nearest_xy
-
-        dense_cells = unique_cells[dense_mask]
-        dense_set = {tuple(c.tolist()) for c in dense_cells}
-        cell_count = {tuple(c.tolist()): int(n) for c, n in zip(unique_cells, counts)}
-
-        visited = set()
-        best_component_cells = set()
-        best_component_points = 0
-
-        for cell_arr in dense_cells:
-            start = tuple(cell_arr.tolist())
-            if start in visited:
-                continue
-
-            stack = [start]
-            visited.add(start)
-            component_cells = set()
-            component_points = 0
-
-            while stack:
-                cx, cy = stack.pop()
-                cell = (cx, cy)
-                component_cells.add(cell)
-                component_points += cell_count.get(cell, 0)
-
-                for dx in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        if dx == 0 and dy == 0:
-                            continue
-                        nxt = (cx + dx, cy + dy)
-                        if nxt in dense_set and nxt not in visited:
-                            visited.add(nxt)
-                            stack.append(nxt)
-
-            if component_points > best_component_points:
-                best_component_points = component_points
-                best_component_cells = component_cells
-
-        if not best_component_cells:
-            cluster_pts = pts
-        else:
-            keep = np.fromiter(
-                (tuple(c.tolist()) in best_component_cells for c in cell_points),
-                dtype=np.bool_,
-                count=cell_points.shape[0],
-            )
-            cluster_pts = pts[keep]
-            if cluster_pts.shape[0] < max(1, int(min_cluster_points)):
-                cluster_pts = pts
-
-        center = np.median(cluster_pts, axis=0).astype(np.float32)
-        # Same ordering as norm(), but avoids sqrt for better speed.
-        nearest_idx = int(np.argmin(np.sum(cluster_pts * cluster_pts, axis=1)))
-        nearest_xy = cluster_pts[nearest_idx].astype(np.float32)
-        return center, nearest_xy
-
-
-    def ros_image_to_cv2(self, ros_image: Image) -> np.ndarray:
-        """Convert a ROS Image message into an OpenCV BGR image."""
-        data = np.frombuffer(ros_image.data, dtype=np.uint8)
-        h, w = ros_image.height, ros_image.width
-        enc = (ros_image.encoding or "").lower()
-
-        if h > 0 and w > 0:
-            if enc in ("bgr8", "rgb8"):
-                expected = h * w * 3
-                if data.size >= expected:
-                    frame = data[:expected].reshape((h, w, 3))
-                    if enc == "rgb8":
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    return frame
-            elif enc in ("bgra8", "rgba8"):
-                expected = h * w * 4
-                if data.size >= expected:
-                    frame = data[:expected].reshape((h, w, 4))
-                    if enc == "rgba8":
-                        return cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                    return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            elif enc in ("mono8", "8uc1"):
-                expected = h * w
-                if data.size >= expected:
-                    gray = data[:expected].reshape((h, w))
-                    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-        decoded = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if decoded is None:
-            raise ValueError(
-                "Unsupported image data "
-                f"(encoding={ros_image.encoding}, h={h}, w={w}, bytes={len(ros_image.data)})"
-            )
-        return decoded
-
-    def cv2_to_ros_image(self, image_bgr: np.ndarray, header) -> Image:
-        """Convert an OpenCV BGR image into a ROS Image message with the given header."""
-        if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-            raise ValueError(f"Expected HxWx3 BGR image, got shape={image_bgr.shape}")
-
-        h, w, c = image_bgr.shape
-        ros_image = Image()
-        ros_image.header = header
-        ros_image.height = h
-        ros_image.width = w
-        ros_image.encoding = "bgr8"
-        ros_image.is_bigendian = 0
-        ros_image.step = w * c
-        ros_image.data = image_bgr.tobytes()
-        return ros_image
-
     @staticmethod
     def _as_float_seconds(stamp) -> float:
         """Normalize ROS time-like objects to float seconds."""
         if hasattr(stamp, "to_sec"):
             return float(stamp.to_sec())
         return float(stamp)
-
-    def _read_xyzuv(self, cloud_msg: PointCloud2) -> np.ndarray:
-        """Vectorized PointCloud2 decode: return finite (x,y,z,u,v)."""
-        u_name = 'u'
-        v_name = 'v'
-        field_map = {f.name: f for f in cloud_msg.fields}
-        dtype_map = {
-            PointField.INT8: "i1",
-            PointField.UINT8: "u1",
-            PointField.INT16: "i2",
-            PointField.UINT16: "u2",
-            PointField.INT32: "i4",
-            PointField.UINT32: "u4",
-            PointField.FLOAT32: "f4",
-            PointField.FLOAT64: "f8",
-        }
-
-        names: List[str] = []
-        formats: List[str] = []
-        offsets: List[int] = []
-        endian = ">" if cloud_msg.is_bigendian else "<"
-        for name in ("x", "y", "z", u_name, v_name):
-            field = field_map[name]
-            if int(field.count) != 1:
-                raise ValueError(f"Field '{name}' has count={field.count}, only scalar fields are supported")
-            base_fmt = dtype_map.get(field.datatype)
-            if base_fmt is None:
-                raise ValueError(f"Unsupported PointField datatype={field.datatype} for field '{name}'")
-            names.append(name)
-            formats.append(endian + base_fmt)
-            offsets.append(int(field.offset))
-
-        point_dtype = np.dtype(
-            {
-                "names": names,
-                "formats": formats,
-                "offsets": offsets,
-                "itemsize": int(cloud_msg.point_step),
-            }
-        )
-
-        # height 1
-        width = int(cloud_msg.width)
-        height = int(cloud_msg.height)
-        n_points = width * height
-
-        if n_points <= 0:
-            return np.zeros((0, 5), dtype=np.float32)
-
-        expected_bytes = int(cloud_msg.row_step) * height
-        if len(cloud_msg.data) < expected_bytes:
-            raise ValueError(
-                f"PointCloud2 data too short: len(data)={len(cloud_msg.data)} expected>={expected_bytes}"
-            )
-
-        points = np.ndarray(
-            shape=(height, width),
-            dtype=point_dtype,
-            buffer=cloud_msg.data,
-            strides=(int(cloud_msg.row_step), int(cloud_msg.point_step)),
-        )
-
-        x = np.asarray(points["x"], dtype=np.float32).reshape(-1)
-        y = np.asarray(points["y"], dtype=np.float32).reshape(-1)
-        z = np.asarray(points["z"], dtype=np.float32).reshape(-1)
-        u = np.asarray(points[u_name], dtype=np.float32).reshape(-1)
-        v = np.asarray(points[v_name], dtype=np.float32).reshape(-1)
-
-        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(u) & np.isfinite(v)
-        finite_count = int(np.count_nonzero(finite))
-        if finite_count == 0:
-            return np.zeros((0, 5), dtype=np.float32)
-
-        x = x[finite]
-        y = y[finite]
-        z = z[finite]
-        u = u[finite]
-        v = v[finite]
-        
-        xyzuv = np.stack((x, y, z, u, v), axis=1).astype(np.float32, copy=False)
-        return xyzuv
-    
-
-    @staticmethod
-    def _build_cloud_xyz(header, xyz: np.ndarray) -> PointCloud2:
-        """Build a PointCloud2 containing only x/y/z fields from an Nx3 array."""
-        fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        return pc2.create_cloud(header, fields, xyz.astype(np.float32).tolist())
 
     @staticmethod
     def _bbox_mask(shape_hw: Tuple[int, int], box_xyxy: np.ndarray) -> np.ndarray:
@@ -611,6 +391,27 @@ class FusionLidarCameraNode:
         )
         return True
 
+    def _log_stage_timing(
+        self,
+        stage_times_ms: List[Tuple[str, float]],
+        frame_stamp_sec: float,
+        cmd_seq: int,
+        caption: str,
+        status: str,
+    ) -> None:
+        """Log one-line stage timing profile for current job."""
+        now_sec = rospy.Time.now().to_sec()
+        frame_age_ms = (now_sec - frame_stamp_sec) * 1000.0 if frame_stamp_sec > 0.0 else float("nan")
+        parts = [f"{k}={v:.2f}ms" for k, v in stage_times_ms]
+        rospy.loginfo(
+            "time_profile status=%s cmd_seq=%d frame_age=%.2fms caption='%s' %s",
+            status,
+            cmd_seq,
+            frame_age_ms,
+            caption,
+            " ".join(parts),
+        )
+
     def _worker_loop(self) -> None:
         """Consume latest queued jobs and run heavy GDINO+SAM+pointcloud processing."""
         while not rospy.is_shutdown() and not self.stop_event.is_set():
@@ -636,15 +437,30 @@ class FusionLidarCameraNode:
         caption = job["caption"]
         cmd_seq = int(job["cmd_seq"])
         queue_wait = rospy.Time.now().to_sec() - float(job["enqueue_wall_sec"])
+        t_total_start = time.perf_counter()
+        stage_times_ms: List[Tuple[str, float]] = [("queue_wait", queue_wait * 1000.0)]
+
+        def finish(status: str) -> None:
+            stage_times_ms.append(("total", (time.perf_counter() - t_total_start) * 1000.0))
+            self._log_stage_timing(
+                stage_times_ms=stage_times_ms,
+                frame_stamp_sec=frame_stamp_sec,
+                cmd_seq=cmd_seq,
+                caption=caption,
+                status=status,
+            )
 
         with self.state_lock:
             latest_cmd_seq = self.cmd_seq
         if cmd_seq != latest_cmd_seq:
+            finish("drop_cmd_seq")
             return
 
         if self._job_too_old(frame_stamp_sec, "queued job"):
+            finish("drop_queued_old")
             return
 
+        t_tf = time.perf_counter()
         try:
             self.tf_listener.waitForTransform(
                 self.goal_frame,
@@ -657,7 +473,9 @@ class FusionLidarCameraNode:
                 self.base_frame,
                 frame_stamp,
             )
+            stage_times_ms.append(("tf_lookup", (time.perf_counter() - t_tf) * 1000.0))
         except Exception as exc:
+            stage_times_ms.append(("tf_lookup", (time.perf_counter() - t_tf) * 1000.0))
             rospy.logwarn_throttle(
                 1.0,
                 "drop frame by TF mismatch: %s <- %s at stamp=%.6f | %s",
@@ -666,19 +484,26 @@ class FusionLidarCameraNode:
                 self._as_float_seconds(frame_stamp),
                 str(exc),
             )
+            finish("drop_tf")
             return
 
+        t_prep = time.perf_counter()
         base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
-        image = self.ros_image_to_cv2(image_msg)
+        image = camera_handle._ros_image_to_cv2_fallback(image_msg)
+        stage_times_ms.append(("prep_image", (time.perf_counter() - t_prep) * 1000.0))
 
-        detections, labels = self.gdino_model.predict(
+        t_detect = time.perf_counter()
+        detections, labels = self.detecte_model.predict(
             image=image,
             caption=caption
         )
+        stage_times_ms.append(("detect", (time.perf_counter() - t_detect) * 1000.0))
         if len(detections.xyxy) == 0:
             rospy.logwarn("No detections for caption='%s'", caption)
+            finish("drop_no_detection")
             return
 
+        t_pick = time.perf_counter()
         conf = (
             np.asarray(detections.confidence, dtype=np.float32)
             if getattr(detections, "confidence", None) is not None
@@ -687,9 +512,12 @@ class FusionLidarCameraNode:
         best_idx = int(np.argmax(conf))
         box_xyxy = detections.xyxy[best_idx]
         gdino_score = float(conf[best_idx]) if best_idx < len(conf) else 0.0
+        stage_times_ms.append(("select_box", (time.perf_counter() - t_pick) * 1000.0))
 
+        t_mask = time.perf_counter()
         if self.use_bbox_mask_only:
             mask = self._bbox_mask(image.shape[:2], box_xyxy)
+            stage_times_ms.append(("bbox_mask", (time.perf_counter() - t_mask) * 1000.0))
         else:
             mask, _, _ = self.sam_model.get_mask_by_box(
                 box_xyxy=box_xyxy,
@@ -697,22 +525,30 @@ class FusionLidarCameraNode:
                 image_format="BGR",
                 multimask_output=False,
             )
+            stage_times_ms.append(("sam", (time.perf_counter() - t_mask) * 1000.0))
         if self.mask_dilate_px > 0:
+            t_dilate = time.perf_counter()
             k = self.mask_dilate_px * 2 + 1
             kernel = np.ones((k, k), dtype=np.uint8)
             mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+            stage_times_ms.append(("mask_dilate", (time.perf_counter() - t_dilate) * 1000.0))
 
-        xyzuv_inside = self._read_xyzuv(cloud_msg)
+        t_read_cloud = time.perf_counter()
+        xyzuv_inside = cloudpoints_handle._read_xyzuv(cloud_msg)
+        stage_times_ms.append(("read_xyzuv", (time.perf_counter() - t_read_cloud) * 1000.0))
         if xyzuv_inside.shape[0] == 0:
             rospy.logwarn("No points from %s", self.topic_visual_points)
+            finish("drop_no_xyzuv")
             return
 
+        t_filter_points = time.perf_counter()
         u_inside = np.rint(xyzuv_inside[:, 3]).astype(np.int16)
         v_inside = np.rint(xyzuv_inside[:, 4]).astype(np.int16)
 
         on_object = mask[u_inside, v_inside]
         object_xyzuv = xyzuv_inside[on_object]
         object_xyz = object_xyzuv[:, :3] if object_xyzuv.shape[0] > 0 else np.zeros((0, 3), dtype=np.float32)
+        stage_times_ms.append(("mask_filter", (time.perf_counter() - t_filter_points) * 1000.0))
 
         if object_xyz.shape[0] < self.min_points:
             rospy.logwarn(
@@ -722,9 +558,10 @@ class FusionLidarCameraNode:
             )
 
 
+        t_cluster = time.perf_counter()
         if object_xyz.shape[0] > 0:
             min_points_per_cell, min_cluster_points = self._cluster_params(object_xyz.shape[0])
-            center, nearest_surface_xy = self.cluster_2d_center_nearest_surface(
+            center, nearest_surface_xy = cloudpoints_handle.cluster_2d_center_nearest_surface(
                 object_xyz[:, :2],
                 grid_size=self.cluster_grid_size,
                 min_points_per_cell=min_points_per_cell,
@@ -733,10 +570,13 @@ class FusionLidarCameraNode:
         else:
             center = np.array([np.nan, np.nan], dtype=np.float32)
             nearest_surface_xy = np.array([np.nan, np.nan], dtype=np.float32)
+        stage_times_ms.append(("cluster", (time.perf_counter() - t_cluster) * 1000.0))
 
         if self._job_too_old(frame_stamp_sec, "inference result"):
+            finish("drop_infer_old")
             return
 
+        t_payload = time.perf_counter()
         payload = self._get_payload(
             stamp_sec=self._as_float_seconds(image_msg.header.stamp),
             frame_id=cloud_msg.header.frame_id,
@@ -748,9 +588,11 @@ class FusionLidarCameraNode:
             num_points=object_xyz.shape[0],
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        stage_times_ms.append(("publish_json", (time.perf_counter() - t_payload) * 1000.0))
 
+        t_debug = time.perf_counter()
         if self.enable_debug_overlay:
-            annotated = self.gdino_model.annotate(image, detections, labels)
+            annotated = self.detecte_model.annotate(image, detections, labels)
             debug = annotated
             debug[mask] = (debug[mask] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4).astype(np.uint8)
 
@@ -764,13 +606,15 @@ class FusionLidarCameraNode:
             cv2.putText(debug, line2, (x, y0 + 1 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line3, (x, y0 + 2 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line4, (x, y0 + 3 * dy), font, scale, color, thick, cv2.LINE_AA)
-            self.pub_debug_image.publish(self.cv2_to_ros_image(debug, image_msg.header))
-            self.pub_object_points.publish(self._build_cloud_xyz(cloud_msg.header, object_xyz))
+            self.pub_debug_image.publish(camera_handle._cv2_to_ros_image_fallback(debug, image_msg.header))
+            self.pub_object_points.publish(cloudpoints_handle._build_cloud_xyz(cloud_msg.header, object_xyz))
 
             if self.save_debug_images:
                 stamp_ns = str(image_msg.header.stamp.to_nsec())
                 cv2.imwrite(os.path.join(self.output_dir, f"{stamp_ns}_debug.jpg"), debug)
+        stage_times_ms.append(("debug_overlay", (time.perf_counter() - t_debug) * 1000.0))
 
+        t_goal = time.perf_counter()
         if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
             self._send_follow_goal(
                 center_xy=payload["centroid_xy_m"],
@@ -778,6 +622,8 @@ class FusionLidarCameraNode:
                 base_trans=(float(trans[0]), float(trans[1]), float(trans[2])),
                 base_yaw=base_yaw,
             )
+        stage_times_ms.append(("send_goal", (time.perf_counter() - t_goal) * 1000.0))
+        finish("ok")
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""
@@ -802,7 +648,7 @@ class FusionLidarCameraNode:
             run_mode = self.run
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
-            caption = self.gdino_model.caption
+            caption = self.detecte_model.caption
 
             if run_mode not in (RECON, FOLLOW):
                 return

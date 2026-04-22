@@ -1,5 +1,5 @@
 import points_project
-from cloudpoints_handle import CloudPointsHandle
+from camdepthfusion import cloudpoints_handle
 import camera_handle
 import numpy as np
 import rospy
@@ -7,7 +7,7 @@ from sensor_msgs.msg import Image, PointCloud2
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 def callback(image_msg, lidar_msg, pub_):
-    xyzuv_lidar = CloudPointsHandle._read_xyzuv(lidar_msg)
+    xyzuv_lidar = cloudpoints_handle._read_xyzuv(lidar_msg)
     uv = xyzuv_lidar[:, 3:5]
 
     uv = uv[:,::-1]  # Convert (u,v) to (v,u) for visualization

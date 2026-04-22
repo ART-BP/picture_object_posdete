@@ -10,7 +10,7 @@ from typing import Union
 import numpy as np
 import cv2
 
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Tuple
 
 
 Yoloeroot = os.path.dirname(os.path.abspath(__file__))
@@ -24,19 +24,32 @@ modes_ = ("11l", "11m", "11s", "v8l", "v8m", "v8s")
 
 class Yoloe:
     def __init__(self, model_id="11l"):
+        self._cached_class_names: Optional[Tuple[str, ...]] = None
+        self._cached_text_pe = None
         self.select_model(model_id)
         self.model.to("cuda" if torch.cuda.is_available() else "cpu")
         self.caption = "black box"
         self.return_labels = True
+        self.threshold = 0.85
 
     def select_model(self, model_id):
         model_name = Path(os.path.join(Yoloeroot, f"weights/yoloe-{model_id}-seg.pt"))
-        print(model_name)
+        self.name = f"yoloe-{model_id}-seg.pt"
         if model_name.exists():
             self.model = YOLOE(model_name)
         else:
             self.model = YOLOE(os.path.join(Yoloeroot, "weights/yoloe-11l-seg.pt"))
             print("Warning: input model {model} is not exist")
+        # Model instance changed, so cached embeddings must be rebuilt.
+        self._cached_class_names = None
+        self._cached_text_pe = None
+
+    def _set_classes_with_cache(self, names: List[str]) -> None:
+        names_key = tuple(names)
+        if self._cached_text_pe is None or self._cached_class_names != names_key:
+            self._cached_text_pe = self.model.get_text_pe(names)
+            self._cached_class_names = names_key
+        self.model.set_classes(names, self._cached_text_pe)
 
     def setparameters(
         self,
@@ -69,8 +82,8 @@ class Yoloe:
         names = self._normalize_names(caption if caption is not None else self.caption)
         if not names:
             names = ["object"]
-        self.model.set_classes(names, self.model.get_text_pe(names))
-        results = self.model.predict(image, verbose=False)
+        self._set_classes_with_cache(names)
+        results = self.model.predict(image, verbose=False, conf=self.threshold)
         detections = sv.Detections.from_ultralytics(results[0])
         labels = []
         if self.return_labels:
@@ -85,16 +98,20 @@ class Yoloe:
         names = self._normalize_names(names)
         if not names:
             names = ["object"]
-        self.model.set_classes(names, self.model.get_text_pe(names))
-        results = self.model.predict(image, verbose=False)
+        self._set_classes_with_cache(names)
+        results = self.model.predict(image, verbose=False, conf=self.threshold)
         detections = sv.Detections.from_ultralytics(results[0])
-
         return detections
     
-    def predict_with_visual_prompt(self, source_image, target_image, bbox):
+    def predict_with_visual_prompt(self, source_image, target_image, bbox, caption=None):
+        bbox_arr = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        if bbox_arr.size != 4:
+            raise ValueError(f"bbox must contain 4 values [x1,y1,x2,y2], got shape={np.asarray(bbox).shape}")
+        bbox_xyxy = bbox_arr.tolist()
+
         visual_prompts = {
-            "bboxes": [bbox],
-            "cls": [0],                        
+            "bboxes": [bbox_xyxy],
+            "cls": [0],
         }
 
         results = self.model.predict(
@@ -102,13 +119,14 @@ class Yoloe:
             refer_image=target_image,
             visual_prompts=visual_prompts,
             predictor=YOLOEVPSegPredictor,
-            conf=0.45,
-            save=True,
+            conf=self.threshold,
+            save=False,
             project="yoloe/output",
             name="vp_demo",
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         detections = sv.Detections.from_ultralytics(results[0])
+        labels = []
         if self.return_labels:
             labels = [
             f"{class_name} {confidence:.2f}"

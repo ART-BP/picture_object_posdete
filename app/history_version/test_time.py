@@ -40,35 +40,41 @@ def _stats(vals: List[float]) -> str:
 def main():
     rospy.init_node("test_gdino_node")
 
-    image_path = rospy.get_param("~image", default=os.path.join(rootdir, "bag/test.jpg"))
+    image_path = rospy.get_param("~image", default=os.path.join(rootdir, "bag/test0.jpg"))
     caption = rospy.get_param("~caption", "black box")
     box_threshold = float(rospy.get_param("~box_threshold", 0.45))
     text_threshold = float(rospy.get_param("~text_threshold", 0.35))
-    warmup_iters = int(rospy.get_param("~warmup_iters", 5))
+    warmup_iters = int(rospy.get_param("~warmup_iters", 0))
     test_iters = int(rospy.get_param("~test_iters", 20))
     sleep_s = float(rospy.get_param("~sleep_s", 0.0))
-    resize_scale = float(rospy.get_param("~resize_scale", 1.0))
     reuse_sam_image_embedding = _as_bool(rospy.get_param("~reuse_sam_image_embedding", False))
+    select_model = rospy.get_param("~select_model", "gdino").strip().lower()
 
+    print(select_model)
     t0 = time.perf_counter()
-    model = gdino.GroundingDINO()
-    model.setparameters(caption=caption, box_threshold=box_threshold, text_threshold=text_threshold)
+    if select_model.startswith("yoloe"):
+        if select_model.endswith("v8m"):
+            model = Yoloe("v8m")
+        elif select_model.endswith("v8l"):
+            model = Yoloe("v8l")
+        elif select_model.endswith("v8s"):
+            model = Yoloe("v8s")
+        elif select_model.endswith("11l"): 
+            model = Yoloe("11l")
+        elif select_model.endswith("11m"):
+            model = Yoloe("11m")
+        else:
+            model = Yoloe("11s")
+    else:
+        model = gdino.GroundingDINO()
+        model.setparameters(caption=caption, box_threshold=box_threshold, text_threshold=text_threshold)
     
+    rospy.loginfo("select model is %s", model.name)
     sam_model = Sam()
     t1 = time.perf_counter()
     rospy.loginfo("construct model cost: %.4fs", t1 - t0)
 
     image = model.read_image(image_path)
-    if resize_scale > 0.0 and resize_scale != 1.0:
-        h, w = image.shape[:2]
-        new_w = max(1, int(round(w * resize_scale)))
-        new_h = max(1, int(round(h * resize_scale)))
-        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        rospy.loginfo("resize image: (%d, %d) -> (%d, %d)", w, h, new_w, new_h)
-
-    # Optional: only valid for static-image benchmarking.
-    if reuse_sam_image_embedding:
-        sam_model.set_image(image=image, image_format="BGR")
 
     rospy.loginfo(
         "benchmark config: warmup=%d, test_iters=%d, caption='%s', reuse_sam_image_embedding=%s",
@@ -77,27 +83,6 @@ def main():
         caption,
         str(reuse_sam_image_embedding),
     )
-
-    for _ in range(max(0, warmup_iters)):
-        if rospy.is_shutdown():
-            return
-        _sync_cuda()
-        detections, _ = model.predict(
-            image=image,
-            caption=caption,
-        )
-        if len(detections.xyxy) > 0:
-            xyxy = detections.xyxy[0]
-            if reuse_sam_image_embedding:
-                sam_model.get_mask_by_box(box_xyxy=xyxy, multimask_output=False)
-            else:
-                sam_model.get_mask_by_box(
-                    box_xyxy=xyxy,
-                    image=image,
-                    image_format="BGR",
-                    multimask_output=False,
-                )
-        _sync_cuda()
 
     total_costs: List[float] = []
     gdino_costs: List[float] = []
@@ -133,18 +118,18 @@ def main():
         _sync_cuda()
         t_end = time.perf_counter()
 
-        gdino_dt = t_gdino - t_start
+        detection_dt = t_gdino - t_start
         sam_dt = t_end - t_gdino
         total_dt = t_end - t_start
-        gdino_costs.append(gdino_dt)
+        gdino_costs.append(detection_dt)
         sam_costs.append(sam_dt)
         total_costs.append(total_dt)
 
         rospy.loginfo(
-            "[%02d/%02d] gdino=%.4fs sam=%.4fs total=%.4fs",
+            "[%02d/%02d] detection_dt=%.4fs sam=%.4fs total=%.4fs",
             i + 1,
             test_iters,
-            gdino_dt,
+            detection_dt,
             sam_dt,
             total_dt,
         )
@@ -152,7 +137,7 @@ def main():
         if sleep_s > 0.0:
             rospy.sleep(sleep_s)
 
-    rospy.loginfo("GDINO stats: %s", _stats(gdino_costs))
+    rospy.loginfo("detection stats: %s", _stats(gdino_costs))
     rospy.loginfo("SAM stats:   %s", _stats(sam_costs))
     rospy.loginfo("TOTAL stats: %s", _stats(total_costs))
 

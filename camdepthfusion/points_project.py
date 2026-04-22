@@ -6,10 +6,10 @@ from typing import Any, Dict
 
 import cv2
 import numpy as np
-from camera_handle import _estimate_fisheye_theta_limit
+from camdepthfusion.camera_handle import _estimate_fisheye_theta_limit
 
 MAX_OVERLAY_POINTS = 20000
-POINT_RADIUS = 1
+POINT_RADIUS = 3
 MIN_DEPTH = 0.1
 MIN_OBJECT_POINTS = 5
 
@@ -333,6 +333,21 @@ def draw_overlay(image_bgr: np.ndarray, uv: np.ndarray, depth: np.ndarray) -> np
         u_i = int(uv_int[i, 0])
         v_i = int(uv_int[i, 1])
         c = (int(colors[i, 0]), int(colors[i, 1]), int(colors[i, 2]))
+        cv2.circle(overlay, (u_i, v_i), int(POINT_RADIUS), c, -1, lineType=cv2.LINE_AA)
+
+    return overlay
+
+def draw_overlay_withblack(image_bgr: np.ndarray, uv: np.ndarray) -> np.ndarray:
+    overlay = image_bgr.copy()
+    count = int(uv.shape[0])
+    if count <= 0:
+        return overlay
+
+    uv_int = np.round(uv).astype(np.int32)
+    for i in range(uv_int.shape[0]):
+        u_i = int(uv_int[i, 0])
+        v_i = int(uv_int[i, 1])
+        c = (int(255), int(255), int(255))
         cv2.circle(overlay, (u_i, v_i), int(POINT_RADIUS), c, -1, lineType=cv2.LINE_AA)
 
     return overlay

@@ -81,7 +81,7 @@ class GroundingDINO(Model):
         self.image: Optional[np.ndarray] = None
         self.box_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
         self.label_annotator = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    
+        self.name = "gdino"
     def setparameters(
         self,
         caption: Optional[str] = None,
