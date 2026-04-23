@@ -1,6 +1,6 @@
-import points_project
+from camdepthfusion import points_project
 from camdepthfusion import cloudpoints_handle
-import camera_handle
+from camdepthfusion import camera_handle
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image, PointCloud2

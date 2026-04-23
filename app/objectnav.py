@@ -30,7 +30,7 @@ from tf.transformations import quaternion_from_euler
 from camdepthfusion import points_project
 from camdepthfusion import cloudpoints_handle
 from camdepthfusion import camera_handle
-from recovery import RecoveryAction, RecoveryController
+from app.recovery import RecoveryAction, RecoveryController
 
 
 class TaskState(IntEnum):
@@ -90,8 +90,8 @@ class FusionLidarCameraNode:
         self.topic_points = self._cfg_get(cfg, "topic_points", "/lidar_points", str)
 
         caption = self._cfg_get(cfg, "caption", "black box", str)
-        box_threshold = self._cfg_get(cfg, "box_threshold", 0.55, float)
-        text_threshold = self._cfg_get(cfg, "text_threshold", 0.85, float)
+        box_threshold = self._cfg_get(cfg, "box_threshold", 0.65, float)
+        text_threshold = self._cfg_get(cfg, "text_threshold", 0.65, float)
 
         self.sync_slop = self._cfg_get(cfg, "sync_slop", 0.05, float)
         self.sync_queue_size = self._cfg_get(cfg, "sync_queue_size", 1, int)
@@ -273,7 +273,11 @@ class FusionLidarCameraNode:
 
     def _recovery_loop(self) -> None:
         tick_hz = max(1.0, float(self.recovery_tick_hz))
-        sleep_dt = 1.0 / tick_hz
+        sleep_dt = 1.0 / tick_hz  
+              
+        if self.run == TaskState.Notask:
+            self.stop_event.wait(sleep_dt)            
+
         while not rospy.is_shutdown() and not self.stop_event.is_set():
             event = self.recovery.poll(now_sec=rospy.Time.now().to_sec())
             if event is not None:
@@ -438,6 +442,11 @@ class FusionLidarCameraNode:
         goal_map_x = float(base_trans[0] + cos_yaw * goal_x - sin_yaw * goal_y)
         goal_map_y = float(base_trans[1] + sin_yaw * goal_x + cos_yaw * goal_y)
         yaw_map = base_yaw + yaw_center
+
+        self.recovery.on_detection(
+            goal_map_x, goal_map_y,
+            now_sec=rospy.Time.now().to_sec(),
+        )
 
         q = quaternion_from_euler(0.0, 0.0, yaw_map)
 
@@ -697,12 +706,6 @@ class FusionLidarCameraNode:
             num_points=object_xyz.shape[0],
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
-        if payload["centroid_xy_m"] is not None:
-            center_xy = payload["centroid_xy_m"]
-            self.recovery.on_detection(
-                center_xy=(float(center_xy[0]), float(center_xy[1])),
-                now_sec=rospy.Time.now().to_sec(),
-            )
 
         if self.enable_debug_overlay:
             annotated = self.detecte_model.annotate(image, detections, labels)
@@ -730,7 +733,7 @@ class FusionLidarCameraNode:
                 base_trans=(float(trans[0]), float(trans[1]), float(trans[2])),
                 base_yaw=base_yaw,
             )
-        rospy.loginfo("labels: %s  conf: %f", labels[0], gdino_score)
+        rospy.loginfo("labels: %s  conf: %f", labels[best_idx], gdino_score)
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""

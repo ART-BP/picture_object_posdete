@@ -112,7 +112,7 @@ class RecoveryController:
                 self._rotate_sent = True
                 return RecoveryEvent(
                     action=RecoveryAction.ROTATE_IN_PLACE,
-                    heading_rad=heading,
+                    heading_rad=heading if heading is not None else 1.0,
                     lost_sec=lost_sec,
                 )
 

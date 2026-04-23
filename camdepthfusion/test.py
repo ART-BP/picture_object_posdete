@@ -6,7 +6,7 @@ import rospy
 from sensor_msgs.msg import Image, PointCloud2
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
-import camera_handle
+from camdepthfusion import camera_handle
 from camdepthfusion import cloudpoints_handle
 from camdepthfusion import points_project
 
@@ -34,7 +34,7 @@ class LidarImageTester:
             rospy.get_param("~enable_online_extrinsic_update", True)
         )
 
-        params = camera_handle.load_camera_params_from_yaml(camera_model="rational_polynomial")  # For logging camera params and compatibility check
+        params = camera_handle.load_camera_params_from_yaml(camera_model="fisheye")  # For logging camera params and compatibility check
         self.K = np.asarray(params["K"],dtype=np.float64)
         self.D = np.asarray(params["D"],dtype=np.float64)
 
@@ -87,10 +87,25 @@ class LidarImageTester:
             rospy.logwarn_throttle(2.0, "empty cloud after finite filter")
             return
 
-        xyz_lidar = (self.axis_remap.reshape(3, 3) @ xyz_lidar.T).T
+        # xyz_lidar = (self.axis_remap.reshape(3, 3) @ xyz_lidar.T).T
+
+        # h, w = image_bgr.shape[:2]
+        # xyz_proj, uv, depth = points_project.project_lidar_to_image_with_distortion(
+        #     xyz_lidar=xyz_lidar,
+        #     R_optical_lidar=self.R,
+        #     t_optical_lidar=self.T,
+        #     K_camera=self.K,
+        #     width=w,
+        #     height=h,
+        #     dist_coeffs=self.D,
+        #     min_depth=self.min_depth,
+        # )
+        # if xyz_proj.shape[0] == 0:
+        #     rospy.logwarn_throttle(2.0, "no projected points inside image")
+        #     return
 
         h, w = image_bgr.shape[:2]
-        xyz_proj, uv, depth = points_project.project_lidar_to_image_with_rational_polynomial(
+        xyz_proj, uv, depth = points_project.project_lidar_to_image_with_fisheye_distortion(
             xyz_lidar=xyz_lidar,
             R_optical_lidar=self.R,
             t_optical_lidar=self.T,
@@ -104,7 +119,23 @@ class LidarImageTester:
             rospy.logwarn_throttle(2.0, "no projected points inside image")
             return
 
+        # h, w = image_bgr.shape[:2]
+        # xyz_proj, uv, depth = points_project.project_lidar_to_image_with_rational_polynomial(
+        #     xyz_lidar=xyz_lidar,
+        #     R_optical_lidar=self.R,
+        #     t_optical_lidar=self.T,
+        #     K_camera=self.K,
+        #     width=w,
+        #     height=h,
+        #     dist_coeffs=self.D,
+        #     min_depth=self.min_depth,
+        # )
+        # if xyz_proj.shape[0] == 0:
+        #     rospy.logwarn_throttle(2.0, "no projected points inside image")
+        #     return
+        
         try:
+            xyz_proj = (self.axis_remap.reshape(3, 3) @ xyz_proj.T).T
             projected_cloud = cloudpoints_handle._build_cloud_xyzuv(cloud_msg.header, xyz_proj, uv)
             self.pub_projected_cloud.publish(projected_cloud)
         except Exception as exc:
@@ -116,11 +147,11 @@ class LidarImageTester:
         self.pub_debug_image.publish(overlay_msg)
 
         rospy.loginfo_throttle(
-            1.0,
-            "projection ok: input=%d projected=%d",
-            int(xyz_lidar.shape[0]),
-            int(xyz_proj.shape[0]),
-        )
+                1.0,
+                "projection ok: input=%d projected=%d",
+                int(xyz_lidar.shape[0]),
+                int(xyz_proj.shape[0]),
+            )
 
 
 def main() -> None:

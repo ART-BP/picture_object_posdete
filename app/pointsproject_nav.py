@@ -30,7 +30,7 @@ from tf.transformations import quaternion_from_euler
 from camdepthfusion import points_project
 from camdepthfusion import cloudpoints_handle
 from camdepthfusion import camera_handle
-from recovery import RecoveryAction, RecoveryController
+from app.recovery import RecoveryAction, RecoveryController
 
 
 class TaskState(IntEnum):
@@ -202,7 +202,7 @@ class FusionLidarCameraNode:
             "fusionLidarCamera ready: image=%s, points=%s, sync_queue=%d, sync_slop=%.3f, max_infer_fps=%.2f, "
             "debug=%s, bbox_mask_only=%s, max_lidarimage_delay=%.3f, max_tolerate_delay=%.3f, model_id=%s",
             self.topic_image,
-            self.topic_visual_points,
+            self.topic_points,
             max(1, sync_queue_size),
             sync_slop,
             self.max_infer_fps,
@@ -278,7 +278,11 @@ class FusionLidarCameraNode:
 
     def _recovery_loop(self) -> None:
         tick_hz = max(1.0, float(self.recovery_tick_hz))
-        sleep_dt = 1.0 / tick_hz
+        sleep_dt = 1.0 / tick_hz  
+              
+        if self.run == TaskState.Notask:
+            self.stop_event.wait(sleep_dt)  
+
         while not rospy.is_shutdown() and not self.stop_event.is_set():
             event = self.recovery.poll(now_sec=rospy.Time.now().to_sec())
             if event is not None:
@@ -677,10 +681,11 @@ class FusionLidarCameraNode:
             rospy.logwarn_throttle(2.0, "no projected points inside image")
             return
         
-        u_inside = np.rint(uv[:, 0]).astype(np.int16)
-        v_inside = np.rint(uv[:, 1]).astype(np.int16)
+        # uv can be very close to image border; clip after rounding to avoid OOB.
+        u_inside = np.clip(np.rint(uv[:, 0]).astype(np.int32), 0, w - 1)
+        v_inside = np.clip(np.rint(uv[:, 1]).astype(np.int32), 0, h - 1)
 
-        on_object = mask[u_inside, v_inside]
+        on_object = mask[v_inside, u_inside]
         object_xyz = xyz_proj[on_object]
 
         if object_xyz.shape[0] < self.min_points:

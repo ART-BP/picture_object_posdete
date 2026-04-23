@@ -28,23 +28,40 @@ AXIS_REMAP = np.array(
     dtype=np.float64,
 ).reshape(3, 3)
 
+# R = np.array(
+#     [
+#         0.0,
+#         -1.0,
+#         0.0,
+#         0.0,
+#         0.0,
+#         -1.0,
+#         1.0,
+#         0.0,
+#         0.0,
+#     ],
+#     dtype=np.float64,
+# ).reshape(3, 3)
+
+# T = np.array([0.05, 0.08, 0.182], dtype=np.float64)
+
+
 R = np.array(
     [
-        0.0,
-        -1.0,
-        0.0,
-        0.0,
-        0.0,
-        -1.0,
-        1.0,
-        0.0,
-        0.0,
+        -0.999845,
+        -0.0170878,
+        0.00420421,
+        -0.0043689,
+        0.00773508,
+        -0.999961,
+        0.0170546,
+        -0.999824,
+        -0.00780799,
     ],
     dtype=np.float64,
 ).reshape(3, 3)
 
-T = np.array([0.05, 0.08, 0.182], dtype=np.float64)
-
+T = np.array([0.102544, -0.061073, -0.078117], dtype=np.float64)
 
 def project_lidar_to_image(
     xyz_lidar: np.ndarray,
@@ -183,11 +200,11 @@ def project_lidar_to_image_with_rational_polynomial(
     thin-prism/tilt terms (12 or 14 total terms).
     """
     D_all = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
-    if D_all.size < 8:
-        raise ValueError(
-            "rational_polynomial requires at least 8 coefficients "
-            "[k1, k2, p1, p2, k3, k4, k5, k6]"
-        )
+    # if D_all.size < 8:
+    #     raise ValueError(
+    #         "rational_polynomial requires at least 8 coefficients "
+    #         "[k1, k2, p1, p2, k3, k4, k5, k6]"
+    #     )
 
     # OpenCV projectPoints commonly accepts distortion lengths 4/5/8/12/14.
     # For rational_polynomial, normalize to 8/12/14 to keep behavior stable.
