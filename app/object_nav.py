@@ -680,7 +680,7 @@ class FusionLidarCameraNode:
         if xyz_proj.shape[0] == 0:
             rospy.logwarn_throttle(2.0, "no projected points inside image")
             return
-        
+      
         # uv can be very close to image border; clip after rounding to avoid OOB.
         u_inside = np.clip(np.rint(uv[:, 0]).astype(np.int32), 0, w - 1)
         v_inside = np.clip(np.rint(uv[:, 1]).astype(np.int32), 0, h - 1)
@@ -745,7 +745,7 @@ class FusionLidarCameraNode:
             self.pub_debug_image.publish(camera_handle._cv2_to_ros_image_fallback(debug, image_msg.header))
             self.pub_object_points.publish(cloudpoints_handle._build_cloud_xyz(cloud_msg.header, object_xyz))
 
-
+        rospy.loginfo("_send_follow_goal wait") 
         if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
             self._send_follow_goal(
                 center_xy=payload["centroid_xy_m"],
