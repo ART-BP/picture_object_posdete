@@ -31,8 +31,8 @@ def preprocess_caption(caption: str) -> str:
 
 
 def _get_resize_cfg() -> Tuple[int, int]:
-    short_side = int(os.environ.get("GROUNDINGDINO_RESIZE_SHORT", "800"))
-    max_size = int(os.environ.get("GROUNDINGDINO_RESIZE_MAX", "1333"))
+    short_side = int(os.environ.get("GROUNDINGDINO_RESIZE_SHORT", "576"))
+    max_size = int(os.environ.get("GROUNDINGDINO_RESIZE_MAX", "960"))
     short_side = max(64, short_side)
     max_size = max(short_side, max_size)
     return short_side, max_size

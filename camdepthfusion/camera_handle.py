@@ -5,7 +5,7 @@ import os
 from typing import Dict, Any
 DEFAULT_CAMERA_PARAM_YAML = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "param_camera.yaml",
+    "config/param_camera.yaml",
 )
 
 def _ros_image_to_cv2_fallback(ros_image: Image) -> np.ndarray:

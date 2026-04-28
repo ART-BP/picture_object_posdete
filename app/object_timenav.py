@@ -60,7 +60,7 @@ class FusionLidarCameraNode:
 
     @staticmethod
     def _load_runtime_config() -> configparser.SectionProxy:
-        default_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.cfg")
+        default_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/config.cfg")
         config_path = os.environ.get("OBJECTNAV_CONFIG", default_cfg_path)
 
         parser = configparser.ConfigParser()
@@ -813,7 +813,6 @@ class FusionLidarCameraNode:
         stage_times_ms.append(("debug_overlay", (time.perf_counter() - t_debug) * 1000.0))
 
         t_goal = time.perf_counter()
-        rospy.loginfo("_send_follow_goal wait")
         if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
             self._send_follow_goal(
                 center_xy=payload["centroid_xy_m"],
@@ -822,7 +821,6 @@ class FusionLidarCameraNode:
                 base_yaw=base_yaw,
             )
         stage_times_ms.append(("send_goal", (time.perf_counter() - t_goal) * 1000.0))
-        rospy.loginfo("labels: %s  conf: %f", labels[0], gdino_score)
         finish("ok")
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
@@ -831,7 +829,8 @@ class FusionLidarCameraNode:
         image_sec = self._as_float_seconds(image_msg.header.stamp)
         frame_stamp = image_msg.header.stamp if lidar_sec < image_sec else cloud_msg.header.stamp
         frame_stamp_sec = image_sec if lidar_sec < image_sec else lidar_sec
-
+        now = rospy.Time.now().to_sec()
+        rospy.loginfo("lidar_sec: %f, image_sec: %f", now - lidar_sec, now - image_sec)
         now_sec = rospy.Time.now().to_sec()
         if frame_stamp != rospy.Time(0):
             data_delay = now_sec - frame_stamp_sec
