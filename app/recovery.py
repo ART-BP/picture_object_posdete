@@ -27,6 +27,7 @@ class RecoveryController:
         move_after_sec: float = 3.0,
         rotate_after_sec: float = 5.0,
         cancel_after_sec: float = 10.0,
+        rotate_interval_sec: float = 2.0,
     ) -> None:
         if move_after_sec <= 0.0:
             raise ValueError("move_after_sec must be > 0")
@@ -34,10 +35,13 @@ class RecoveryController:
             raise ValueError("rotate_after_sec must be > move_after_sec")
         if cancel_after_sec <= rotate_after_sec:
             raise ValueError("cancel_after_sec must be > rotate_after_sec")
+        if rotate_interval_sec <= 0.0:
+            raise ValueError("rotate_interval_sec must be > 0")
 
         self.move_after_sec = float(move_after_sec)
         self.rotate_after_sec = float(rotate_after_sec)
         self.cancel_after_sec = float(cancel_after_sec)
+        self.rotate_interval_sec = float(rotate_interval_sec)
 
         self._lock = threading.Lock()
         self._active = False
@@ -46,6 +50,7 @@ class RecoveryController:
         self._move_sent = False
         self._rotate_sent = False
         self._cancel_sent = False
+        self._last_rotate_cmd_sec = None
         self.last_pos = None
 
     def on_task(self, task: str, now_sec: float) -> None:
@@ -57,6 +62,7 @@ class RecoveryController:
                 self._move_sent = False
                 self._rotate_sent = False
                 self._cancel_sent = False
+                self._last_rotate_cmd_sec = None
                 return
 
             # Any non-follow task disables recovery timeline.
@@ -64,6 +70,19 @@ class RecoveryController:
             self._move_sent = False
             self._rotate_sent = False
             self._cancel_sent = False
+            self._last_rotate_cmd_sec = None
+
+    def clear(self) -> None:
+        """Clear all recovery timeline state."""
+        with self._lock:
+            self._active = False
+            self._last_detect_sec = 0.0
+            self._last_heading_rad = None
+            self._move_sent = False
+            self._rotate_sent = False
+            self._cancel_sent = False
+            self._last_rotate_cmd_sec = None
+            self.last_pos = None
 
     def on_detection(self, x: float, y: float, now_sec: float) -> None:
         if x is None or y is None:
@@ -86,6 +105,7 @@ class RecoveryController:
             self._move_sent = False
             self._rotate_sent = False
             self._cancel_sent = False
+            self._last_rotate_cmd_sec = None
 
     def poll(self, now_sec: float) -> Optional[RecoveryEvent]:
         with self._lock:
@@ -106,15 +126,24 @@ class RecoveryController:
             if (
                 lost_sec >= self.rotate_after_sec
                 and (self._move_sent or heading is None)
-                and not self._rotate_sent
             ):
-                self._move_sent = True
-                self._rotate_sent = True
-                return RecoveryEvent(
-                    action=RecoveryAction.ROTATE_IN_PLACE,
-                    heading_rad=heading if heading is not None else 1.0,
-                    lost_sec=lost_sec,
-                )
+                should_rotate = False
+                if not self._rotate_sent:
+                    should_rotate = True
+                elif self._last_rotate_cmd_sec is None:
+                    should_rotate = True
+                elif (float(now_sec) - float(self._last_rotate_cmd_sec)) >= self.rotate_interval_sec:
+                    should_rotate = True
+
+                if should_rotate:
+                    self._move_sent = True
+                    self._rotate_sent = True
+                    self._last_rotate_cmd_sec = float(now_sec)
+                    return RecoveryEvent(
+                        action=RecoveryAction.ROTATE_IN_PLACE,
+                        heading_rad=heading if heading is not None else 1.0,
+                        lost_sec=lost_sec,
+                    )
 
             if (
                 lost_sec >= self.cancel_after_sec

@@ -20,7 +20,6 @@ from GroundingDINO.gdino import GroundingDINO
 from MobileSAM.sam import Sam
 from yoloe.yoloe import Yoloe
 
-
 import actionlib
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from geometry_msgs.msg import Quaternion
@@ -59,7 +58,7 @@ class FusionLidarCameraNode:
 
     @staticmethod
     def _load_runtime_config() -> configparser.SectionProxy:
-        default_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.cfg")
+        default_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/config.cfg")
         config_path = os.environ.get("OBJECTNAV_CONFIG", default_cfg_path)
 
         parser = configparser.ConfigParser()
@@ -95,7 +94,7 @@ class FusionLidarCameraNode:
 
         caption = self._cfg_get(cfg, "caption", "black box", str)
         box_threshold = self._cfg_get(cfg, "box_threshold", 0.55, float)
-        text_threshold = self._cfg_get(cfg, "text_threshold", 0.85, float)
+        text_threshold = self._cfg_get(cfg, "text_threshold", 0.55, float)
 
         sync_slop = self._cfg_get(cfg, "sync_slop", 0.05, float)
         sync_queue_size = self._cfg_get(cfg, "sync_queue_size", 1, int)
@@ -122,9 +121,10 @@ class FusionLidarCameraNode:
         self.debug_max_points = self._cfg_get(cfg, "debug_max_points", 500, int)
         self.save_debug_images = self._cfg_get(cfg, "save_debug_images", False, bool)
         self.output_dir = self._cfg_get(cfg, "output_dir", default_output_dir, str)
-        self.recovery_move_after_s = self._cfg_get(cfg, "recovery_move_after_s", 3.0, float)
-        self.recovery_rotate_after_s = self._cfg_get(cfg, "recovery_rotate_after_s", 5.0, float)
-        self.recovery_cancel_after_s = self._cfg_get(cfg, "recovery_cancel_after_s", 10.0, float)
+        self.recovery_move_after_s = self._cfg_get(cfg, "recovery_move_after_s", 5.0, float)
+        self.recovery_rotate_after_s = self._cfg_get(cfg, "recovery_rotate_after_s", 10.0, float)
+        self.recovery_cancel_after_s = self._cfg_get(cfg, "recovery_cancel_after_s", 30.0, float)
+        self.recovery_rotate_interval_s = self._cfg_get(cfg, "recovery_rotate_interval_s", 2.0, float)
         self.recovery_forward_dist_m = self._cfg_get(cfg, "recovery_forward_dist_m", 2.0, float)
         self.recovery_rotate_deg = self._cfg_get(cfg, "recovery_rotate_deg", 90.0, float)
         self.recovery_tick_hz = self._cfg_get(cfg, "recovery_tick_hz", 10.0, float)
@@ -139,6 +139,7 @@ class FusionLidarCameraNode:
             move_after_sec=self.recovery_move_after_s,
             rotate_after_sec=self.recovery_rotate_after_s,
             cancel_after_sec=self.recovery_cancel_after_s,
+            rotate_interval_sec=self.recovery_rotate_interval_s,
         )
 
 
@@ -224,6 +225,9 @@ class FusionLidarCameraNode:
         now = rospy.Time.now()
         now_sec = now.to_sec()
         task = str(tmsg.get("task", "none")).lower()
+
+        # Any new command starts a fresh recovery context.
+        self.recovery.clear()
         with self.state_lock:
             caption = tmsg.get("caption", self.detecte_model.caption)
             self.cmd_seq += 1
@@ -460,21 +464,21 @@ class FusionLidarCameraNode:
         goal.target_pose.pose.orientation = Quaternion(*q)
 
         self.client.send_goal(goal)
-        # rospy.loginfo(
-        #     "sent follow goal (%s): goal=[%.3f, %.3f] center_xy=[%.3f, %.3f] surface_xy=[%.3f, %.3f] "
-        #     "surface_dist=%.3f follow_distance=%.3f yaw_rel=%.3f yaw_map=%.3f",
-        #     self.goal_frame,
-        #     goal_map_x,
-        #     goal_map_y,
-        #     center[0],
-        #     center[1],
-        #     surface[0],
-        #     surface[1],
-        #     surface_dist,
-        #     center_dist * (1- ratio),
-        #     yaw_center,
-        #     yaw_map,
-        # )
+        rospy.loginfo(
+            "sent follow goal (%s): goal=[%.3f, %.3f] center_xy=[%.3f, %.3f] surface_xy=[%.3f, %.3f] "
+            "surface_dist=%.3f follow_distance=%.3f yaw_rel=%.3f yaw_map=%.3f",
+            self.goal_frame,
+            goal_map_x,
+            goal_map_y,
+            center[0],
+            center[1],
+            surface[0],
+            surface[1],
+            surface_dist,
+            center_dist * (1- ratio),
+            yaw_center,
+            yaw_map,
+        )
 
     @staticmethod
     def _as_float_seconds(stamp) -> float:
@@ -708,6 +712,8 @@ class FusionLidarCameraNode:
             center = np.array([np.nan, np.nan], dtype=np.float32)
             nearest_surface_xy = np.array([np.nan, np.nan], dtype=np.float32)
 
+        center_ = np.array([-center[1], center[0]], dtype=np.float32)
+        nearest_surface_xy_ = np.array([-nearest_surface_xy[1], nearest_surface_xy[0]], dtype=np.float32)
         if self._job_too_old(frame_stamp_sec, "inference result"):
             return
 
@@ -717,14 +723,15 @@ class FusionLidarCameraNode:
             caption=caption,
             box_xyxy=[float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])],
             gdino_score=gdino_score,
-            center=center,
-            nearest_surface_xy=nearest_surface_xy,
+            center=center_,
+            nearest_surface_xy=nearest_surface_xy_,
             num_points=object_xyz.shape[0],
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
         if self.run == TaskState.Recognize:
             self.run = TaskState.Notask
+            self.recovery.clear()
             return
         
         if self.enable_debug_overlay:
@@ -745,7 +752,7 @@ class FusionLidarCameraNode:
             self.pub_debug_image.publish(camera_handle._cv2_to_ros_image_fallback(debug, image_msg.header))
             self.pub_object_points.publish(cloudpoints_handle._build_cloud_xyz(cloud_msg.header, object_xyz))
 
-        rospy.loginfo("_send_follow_goal wait") 
+
         if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
             self._send_follow_goal(
                 center_xy=payload["centroid_xy_m"],
@@ -753,7 +760,6 @@ class FusionLidarCameraNode:
                 base_trans=(float(trans[0]), float(trans[1]), float(trans[2])),
                 base_yaw=base_yaw,
             )
-        rospy.loginfo("labels: %s  conf: %f", labels[0], gdino_score)
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""
@@ -794,6 +800,7 @@ class FusionLidarCameraNode:
 
             if  run_mode == TaskState.Follow_once:
                 self.run = TaskState.Notask
+                self.recovery.clear()
 
         job = {
             "image_msg": image_msg,

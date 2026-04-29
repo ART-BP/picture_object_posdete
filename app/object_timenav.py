@@ -767,6 +767,8 @@ class FusionLidarCameraNode:
         else:
             center = np.array([np.nan, np.nan], dtype=np.float32)
             nearest_surface_xy = np.array([np.nan, np.nan], dtype=np.float32)
+        center_ = np.array([-center[1], center[0]], dtype=np.float32)
+        nearest_surface_xy_ = np.array([-nearest_surface_xy[1], nearest_surface_xy[0]], dtype=np.float32)
         stage_times_ms.append(("cluster", (time.perf_counter() - t_cluster) * 1000.0))
 
         if self._job_too_old(frame_stamp_sec, "inference result"):
@@ -780,8 +782,8 @@ class FusionLidarCameraNode:
             caption=caption,
             box_xyxy=[float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])],
             gdino_score=gdino_score,
-            center=center,
-            nearest_surface_xy=nearest_surface_xy,
+            center=center_,
+            nearest_surface_xy=nearest_surface_xy_,
             num_points=object_xyz.shape[0],
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
