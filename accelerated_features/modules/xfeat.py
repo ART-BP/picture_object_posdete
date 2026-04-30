@@ -10,9 +10,21 @@ import torch
 import torch.nn.functional as F
 
 import tqdm
-
-from modules.model import *
-from modules.interpolator import InterpolateSparse2d
+try:
+	# Preferred when imported as a package:
+	#   from accelerated_features.modules.xfeat import XFeat
+	from .model import *
+	from .interpolator import InterpolateSparse2d
+except ImportError:
+	try:
+		# Compatibility with original upstream usage from accelerated_features root:
+		#   from modules.xfeat import XFeat
+		from modules.model import *
+		from modules.interpolator import InterpolateSparse2d
+	except ImportError:
+		# Compatibility with direct execution from modules directory.
+		from model import *
+		from interpolator import InterpolateSparse2d
 
 class XFeat(nn.Module):
 	""" 
@@ -142,7 +154,13 @@ class XFeat(nn.Module):
 		if not self.kornia_available:
 			raise RuntimeError('We rely on kornia for LightGlue. Install with: pip install kornia')
 		elif self.lighterglue is None:
-			from modules.lighterglue import LighterGlue
+			try:
+				from .lighterglue import LighterGlue
+			except ImportError:
+				try:
+					from modules.lighterglue import LighterGlue
+				except ImportError:
+					from lighterglue import LighterGlue
 			self.lighterglue = LighterGlue()
 
 		data = {

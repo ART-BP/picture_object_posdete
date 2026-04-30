@@ -76,7 +76,7 @@ class GroundingDINO(Model):
         self.box_threshold = 0.40
         self.text_threshold = 0.25
         self.return_labels = True
-        self.max_detections = 1
+        self.max_detections = 5
 
         self.image: Optional[np.ndarray] = None
         self.box_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)

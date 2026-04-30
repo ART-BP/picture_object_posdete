@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
+import configparser
 import json
 import math
 import os
 import queue
 import threading
-import time
-from typing import List, Tuple
+from enum import IntEnum
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 import rospy
-
+import sensor_msgs.point_cloud2 as pc2
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import String
 
 from GroundingDINO.gdino import GroundingDINO
 from MobileSAM.sam import Sam
 from yoloe.yoloe import Yoloe
-
 
 import actionlib
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
@@ -29,60 +29,85 @@ from tf.transformations import quaternion_from_euler
 from camdepthfusion import points_project
 from camdepthfusion import cloudpoints_handle
 from camdepthfusion import camera_handle
+from app.recovery import RecoveryAction, RecoveryController
+from accelerated_features.modules.xfeat import XFeat
+from app.params_load import _load_runtime_config, _cfg_get
 
-NOTASK = 0
-FOLLOW = 1
-RECON = 2
+class TaskState(IntEnum):
+    Notask = 0
+    Follow = 1
+    Recognize = 2
+    Follow_once = 3
 
 
 class FusionLidarCameraNode:
     def __init__(self) -> None:
-        """Initialize model instances, ROS params, pubs/subs, and time synchronizer."""
-        self.topic_image = rospy.get_param("~topic_image", "/camera/go2/front/image_raw")
-        self.topic_visual_points = rospy.get_param("~topic_visual_points", "/visual_points/cam_front_lidar")
-        
-        # Detection parameters
-        caption = rospy.get_param("~caption", "black box")
-        box_threshold = float(rospy.get_param("~box_threshold", 0.55))
-        text_threshold = float(rospy.get_param("~text_threshold", 0.85))
+        """Initialize models, runtime config, pubs/subs, and time synchronizer."""
+        cfg = _load_runtime_config()
 
-        self.sync_slop = float(rospy.get_param("~sync_slop", 0.05))
-        self.sync_queue_size = int(rospy.get_param("~sync_queue_size", 1))
-        self.min_points = int(rospy.get_param("~min_points", 5))
-        self.mask_dilate_px = int(rospy.get_param("~mask_dilate_px", 2))
-        self.u_field = rospy.get_param("~u_field", "u")
-        self.v_field = rospy.get_param("~v_field", "v")
-        self.cluster_grid_size = float(rospy.get_param("~cluster_grid_size", 0.2))
-
-        self.cluster_dense_threshold = int(rospy.get_param("~cluster_dense_threshold", 100))
-        self.cluster_min_cell_sparse = int(rospy.get_param("~cluster_min_cell_sparse", 2))
-        self.cluster_min_points_sparse = int(rospy.get_param("~cluster_min_points_sparse", 5))
-        self.cluster_min_cell_dense = int(rospy.get_param("~cluster_min_cell_dense", 5))
-        self.cluster_min_points_dense = int(rospy.get_param("~cluster_min_points_dense", 10))
-        
-        self.min_goal_dist_m = float(rospy.get_param("~min_goal_dist_m", 0.5))
-        self.goal_frame = rospy.get_param("~goal_frame", "map")
-        self.base_frame = rospy.get_param("~base_frame", "base_link")
-        self.tf_timeout_s = float(rospy.get_param("~tf_timeout_s", 0.03))
-        self.max_lidarimage_delay = float(rospy.get_param("~max_lidarimage_delay", 0.6))
-        self.max_tolerate_delay = float(rospy.get_param("~max_tolerate_delay", 0.0))
-        self.max_infer_fps = float(rospy.get_param("~max_infer_fps", 1.0))
-        self.enable_debug_overlay = bool(rospy.get_param("~enable_debug_overlay", True))
-        self.use_bbox_mask_only = bool(rospy.get_param("~use_bbox_mask_only", False))
-        self.debug_max_points = int(rospy.get_param("~debug_max_points", 500))
-        self.save_debug_images = bool(rospy.get_param("~save_debug_images", False))
-        self.output_dir = rospy.get_param(
-            "~output_dir",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output_fusion"),
+        default_output_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "output_fusion",
         )
-        self.run = NOTASK
+
+        params = camera_handle.load_camera_params_from_yaml(camera_model="rational_polynomial")  # For logging camera params and compatibility check
+        self.K = np.asarray(params["K"],dtype=np.float64)
+        self.D = np.asarray(params["D"],dtype=np.float64)
+
+        self.topic_image = _cfg_get(cfg, "topic_image", "/camera/go2/front/image_raw", str)
+        self.topic_points = _cfg_get(cfg, "topic_points", "/lidar_points", str)
+
+        caption = _cfg_get(cfg, "caption", "black box", str)
+        box_threshold = _cfg_get(cfg, "box_threshold", 0.55, float)
+        text_threshold = _cfg_get(cfg, "text_threshold", 0.55, float)
+
+        self.min_points = _cfg_get(cfg, "min_points", 5, int)
+        self.mask_dilate_px = _cfg_get(cfg, "mask_dilate_px", 2, int)
+
+        self.cluster_grid_size = _cfg_get(cfg, "cluster_grid_size", 0.2, float)
+        self.cluster_dense_threshold = _cfg_get(cfg, "cluster_dense_threshold", 100, int)
+        self.cluster_min_cell_sparse = _cfg_get(cfg, "cluster_min_cell_sparse", 2, int)
+        self.cluster_min_points_sparse = _cfg_get(cfg, "cluster_min_points_sparse", 5, int)
+        self.cluster_min_cell_dense = _cfg_get(cfg, "cluster_min_cell_dense", 5, int)
+        self.cluster_min_points_dense = _cfg_get(cfg, "cluster_min_points_dense", 10, int)
+        self.min_goal_dist_m = _cfg_get(cfg, "min_goal_dist_m", 0.5, float)
+        self.goal_frame = _cfg_get(cfg, "goal_frame", "map", str)
+        self.base_frame = _cfg_get(cfg, "base_frame", "base_link", str)
+        self.tf_timeout_s = _cfg_get(cfg, "tf_timeout_s", 0.03, float)
+        self.max_lidarimage_delay = _cfg_get(cfg, "max_lidarimage_delay", 0.6, float)
+        self.max_tolerate_delay = _cfg_get(cfg, "max_tolerate_delay", 0.0, float)
+        self.max_infer_fps = _cfg_get(cfg, "max_infer_fps", 1.0, float)
+        self.enable_debug_overlay = _cfg_get(cfg, "enable_debug_overlay", True, bool)
+        self.use_bbox_mask_only = _cfg_get(cfg, "use_bbox_mask_only", False, bool)
+        self.debug_max_points = _cfg_get(cfg, "debug_max_points", 500, int)
+        self.save_debug_images = _cfg_get(cfg, "save_debug_images", False, bool)
+        self.output_dir = _cfg_get(cfg, "output_dir", default_output_dir, str)
+        self.recovery_move_after_s = _cfg_get(cfg, "recovery_move_after_s", 5.0, float)
+        self.recovery_rotate_after_s = _cfg_get(cfg, "recovery_rotate_after_s", 10.0, float)
+        self.recovery_cancel_after_s = _cfg_get(cfg, "recovery_cancel_after_s", 30.0, float)
+        self.recovery_rotate_interval_s = _cfg_get(cfg, "recovery_rotate_interval_s", 2.0, float)
+        self.recovery_forward_dist_m = _cfg_get(cfg, "recovery_forward_dist_m", 2.0, float)
+        self.recovery_rotate_deg = _cfg_get(cfg, "recovery_rotate_deg", 90.0, float)
+        self.recovery_tick_hz = _cfg_get(cfg, "recovery_tick_hz", 10.0, float)
+        
+        self.run = TaskState.Notask
         self.cmd_stamp = rospy.Time(0)
         self.cmd_seq = 0
         self.last_infer_stamp_sec = 0.0
         self.last_time = rospy.Time.now().to_sec()
+        self.low_identity_streak = 0
+        self.reacquire_counter = 0
         self.state_lock = threading.Lock()
+        self.recovery = RecoveryController(
+            move_after_sec=self.recovery_move_after_s,
+            rotate_after_sec=self.recovery_rotate_after_s,
+            cancel_after_sec=self.recovery_cancel_after_s,
+            rotate_interval_sec=self.recovery_rotate_interval_s,
+        )
 
-        select = rospy.get_param("~model", "gdino")
+
+        select = _cfg_get(cfg, "model", "gdino", str).strip().lower()
+        select = rospy.get_param("~model", select)
         if select == "gdino":
             self.detecte_model = GroundingDINO()
             self.detecte_model.setparameters(caption=caption, box_threshold=box_threshold, 
@@ -92,25 +117,44 @@ class FusionLidarCameraNode:
             model = select[-3:]
             self.detecte_model = Yoloe(model)
             self.detecte_model.setparameters(caption=caption, threshold=box_threshold)
-
+        
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.image_target = cv2.imread(os.path.join(repo_root, "bag", "test0_crop.png"))
+        if self.image_target is None:
+            rospy.logwarn(
+                "template image not found or unreadable: %s",
+                os.path.join(repo_root, "bag", "test0_crop.png"),
+            )
+        self.template_hs_hist = self._compute_hs_hist(self.image_target)
         self.sam_model = Sam()
+
+        self.xfeat = XFeat()
+
         self.tf_listener = tf.TransformListener()
         self.job_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
-        self.worker_thread = threading.Thread(target=self._worker_loop, name="fusion_worker", daemon=True)
-        self.worker_thread.start()
+        self.worker_lock = threading.Lock()
+        self.worker_thread: Optional[threading.Thread] = None
+        self.recovery_thread = threading.Thread(
+            target=self._recovery_loop,
+            name="fusion_recovery",
+            daemon=True,
+        )
+        self.recovery_thread.start()
 
         self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/debug_image", Image, queue_size=1, latch=True)
         self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
         self.pub_depth_json = rospy.Publisher("/fusion_lidar_camera/object_depth_json", String, latch=True, queue_size=2)
 
         #  注册雷达和图像同步
-        self.sub_image = Subscriber(self.topic_image, Image)
-        self.sub_visual_points = Subscriber(self.topic_visual_points, PointCloud2)
+        sync_slop = _cfg_get(cfg, "sync_slop", 0.05, float)
+        sync_queue_size = _cfg_get(cfg, "sync_queue_size", 1, int)
+        sub_image = Subscriber(self.topic_image, Image)
+        sub_points = Subscriber(self.topic_points, PointCloud2)
         self.sync = ApproximateTimeSynchronizer(
-            fs=[self.sub_image, self.sub_visual_points],
-            queue_size=max(1, self.sync_queue_size),
-            slop=self.sync_slop,
+            fs=[sub_image, sub_points],
+            queue_size=max(1, sync_queue_size),
+            slop=sync_slop,
         )
         self.sync.registerCallback(self.synced_callback)
 
@@ -134,15 +178,15 @@ class FusionLidarCameraNode:
             "fusionLidarCamera ready: image=%s, points=%s, sync_queue=%d, sync_slop=%.3f, max_infer_fps=%.2f, "
             "debug=%s, bbox_mask_only=%s, max_lidarimage_delay=%.3f, max_tolerate_delay=%.3f, model_id=%s",
             self.topic_image,
-            self.topic_visual_points,
-            max(1, self.sync_queue_size),
-            self.sync_slop,
+            self.topic_points,
+            max(1, sync_queue_size),
+            sync_slop,
             self.max_infer_fps,
             str(self.enable_debug_overlay),
             str(self.use_bbox_mask_only),
             self.max_lidarimage_delay,
             self.max_tolerate_delay,
-            self.detecte_model.name
+            getattr(self.detecte_model, "name", type(self.detecte_model).__name__),
         )
 
     def cmd_callback(self, msg: String) -> None:
@@ -154,52 +198,165 @@ class FusionLidarCameraNode:
             return
 
         now = rospy.Time.now()
+        now_sec = now.to_sec()
         task = str(tmsg.get("task", "none")).lower()
+
+        # Any new command starts a fresh recovery context.
+        self.recovery.clear()
         with self.state_lock:
             caption = tmsg.get("caption", self.detecte_model.caption)
             self.cmd_seq += 1
 
             self.detecte_model.setparameters(caption=caption)
             if task == "follow":
-                self.run = FOLLOW
+                self.run = TaskState.Follow
                 self.cmd_stamp = now
             elif task == "recognition":
-                self.run = RECON
+                self.run = TaskState.Recognize
                 self.cmd_stamp = now
-            elif task == "cancel":
-                self.run = NOTASK
-                self.cmd_stamp = rospy.Time(0)
+            elif task == "follow_once":
+                self.run = TaskState.Follow_once
+                self.cmd_stamp = now
             else:
-                self.run = NOTASK
+                self.run = TaskState.Notask
 
-            run = self.run
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
+
+        self.recovery.on_task(task=task, now_sec=now_sec)
+
+        if task in ("follow", "recognition", "follow_once"):
+            self._ensure_worker_started()
 
         if task == "cancel":
             self.client.cancel_goal()
             self._clear_pending_jobs()
 
-        self.last_time = now.to_sec()
+        self.last_time = now_sec
         rospy.loginfo(
-            "Received cmd: caption=%s task=%s run=%d cmd_stamp=%.6f cmd_seq=%d",
+            "Received cmd: caption=%s task=%s  cmd_stamp=%.6f cmd_seq=%d",
             caption,
             task,
-            run,
             self._as_float_seconds(cmd_stamp),
             cmd_seq,
         )
+
+    def _ensure_worker_started(self) -> None:
+        """Start worker lazily after receiving a valid task command."""
+        with self.worker_lock:
+            if self.stop_event.is_set():
+                return
+            if self.worker_thread is not None and self.worker_thread.is_alive():
+                return
+            self.worker_thread = threading.Thread(
+                target=self._worker_loop,
+                name="fusion_worker",
+                daemon=True,
+            )
+            self.worker_thread.start()
+
+    def _recovery_loop(self) -> None:
+        tick_hz = max(1.0, float(self.recovery_tick_hz))
+        sleep_dt = 1.0 / tick_hz  
+              
+        if self.run == TaskState.Notask:
+            self.stop_event.wait(sleep_dt)  
+
+        while not rospy.is_shutdown() and not self.stop_event.is_set():
+            event = self.recovery.poll(now_sec=rospy.Time.now().to_sec())
+            if event is not None:
+                self._handle_recovery_event(event)
+            self.stop_event.wait(sleep_dt)
+
+    def _lookup_base_pose(self) -> Optional[Tuple[Tuple[float, float, float], float]]:
+        try:
+            self.tf_listener.waitForTransform(
+                self.goal_frame,
+                self.base_frame,
+                rospy.Time(0),
+                rospy.Duration(self.tf_timeout_s),
+            )
+            trans, rot = self.tf_listener.lookupTransform(
+                self.goal_frame,
+                self.base_frame,
+                rospy.Time(0),
+            )
+            base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
+            return (float(trans[0]), float(trans[1]), float(trans[2])), base_yaw
+        except Exception as exc:
+            rospy.logwarn_throttle(1.0, "recovery TF lookup failed: %s", str(exc))
+            return None
+
+    def _send_recovery_forward_goal(self, heading_rad: float) -> None:
+        pose = self._lookup_base_pose()
+        if pose is None:
+            return
+        base_trans, base_yaw = pose
+        yaw_map = base_yaw + float(heading_rad)
+        goal_x = float(base_trans[0] + self.recovery_forward_dist_m * math.cos(yaw_map))
+        goal_y = float(base_trans[1] + self.recovery_forward_dist_m * math.sin(yaw_map))
+        q = quaternion_from_euler(0.0, 0.0, yaw_map)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.goal_frame
+        goal.target_pose.pose.position.x = goal_x
+        goal.target_pose.pose.position.y = goal_y
+        goal.target_pose.pose.position.z = 0.0
+        goal.target_pose.pose.orientation = Quaternion(*q)
+        self.client.send_goal(goal)
+
+    def _send_recovery_rotate_goal(self, heading_rad: float) -> None:
+        pose = self._lookup_base_pose()
+        if pose is None:
+            return
+        base_trans, base_yaw = pose
+        turn_sign = 1.0 if float(heading_rad) >= 0.0 else -1.0
+        yaw_map = base_yaw + turn_sign * math.radians(float(self.recovery_rotate_deg))
+        q = quaternion_from_euler(0.0, 0.0, yaw_map)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.goal_frame
+        goal.target_pose.pose.position.x = float(base_trans[0])
+        goal.target_pose.pose.position.y = float(base_trans[1])
+        goal.target_pose.pose.position.z = 0.0
+        goal.target_pose.pose.orientation = Quaternion(*q)
+        self.client.send_goal(goal)
+
+    def _handle_recovery_event(self, event) -> None:
+        if event.action == RecoveryAction.MOVE_LAST_DIRECTION:
+            self._send_recovery_forward_goal(event.heading_rad)
+            rospy.logwarn("recovery move triggered: lost=%.2fs", event.lost_sec)
+            return
+
+        if event.action == RecoveryAction.ROTATE_IN_PLACE:
+            self._send_recovery_rotate_goal(event.heading_rad)
+            rospy.logwarn("recovery rotate triggered: lost=%.2fs", event.lost_sec)
+            return
+
+        if event.action == RecoveryAction.CANCEL_TASK:
+            with self.state_lock:
+                self.run = TaskState.Notask
+                self.cmd_stamp = rospy.Time(0)
+                self.cmd_seq += 1
+            self.client.cancel_goal()
+            self._clear_pending_jobs()
+            rospy.logwarn("recovery cancel triggered: lost=%.2fs", event.lost_sec)
 
     def _on_shutdown(self) -> None:
         """Stop worker thread quickly during node shutdown."""
         self.stop_event.set()
         self._clear_pending_jobs()
-        try:
-            self.job_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=0.5)
+        if self.recovery_thread.is_alive():
+            self.recovery_thread.join(timeout=0.5)
+        worker = self.worker_thread
+        if worker is not None and worker.is_alive():
+            try:
+                self.job_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join(timeout=0.5)
 
     def _clear_pending_jobs(self) -> None:
         """Drop all queued jobs so outdated frames are not processed."""
@@ -270,6 +427,7 @@ class FusionLidarCameraNode:
         goal_map_y = float(base_trans[1] + sin_yaw * goal_x + cos_yaw * goal_y)
         yaw_map = base_yaw + yaw_center
 
+        self.recovery.on_detection(goal_map_x, goal_map_y, rospy.Time.now().to_sec())
         q = quaternion_from_euler(0.0, 0.0, yaw_map)
 
         goal = MoveBaseGoal()
@@ -320,6 +478,28 @@ class FusionLidarCameraNode:
         mask = np.zeros((h, w), dtype=bool)
         mask[y1 : y2 + 1, x1 : x2 + 1] = True
         return mask
+
+    @staticmethod
+    def _compute_hs_hist(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """Compute normalized HS histogram for a BGR crop/image."""
+        if image_bgr is None or image_bgr.size == 0:
+            return None
+        h, w = image_bgr.shape[:2]
+        if h < 8 or w < 8:
+            return None
+        # Prefer center region to reduce background impact.
+        y1 = int(0.2 * h)
+        y2 = int(0.85 * h)
+        x1 = int(0.2 * w)
+        x2 = int(0.8 * w)
+        if y2 <= y1 or x2 <= x1:
+            roi = image_bgr
+        else:
+            roi = image_bgr[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        return hist
 
     def _get_payload(
         self,
@@ -391,27 +571,6 @@ class FusionLidarCameraNode:
         )
         return True
 
-    def _log_stage_timing(
-        self,
-        stage_times_ms: List[Tuple[str, float]],
-        frame_stamp_sec: float,
-        cmd_seq: int,
-        caption: str,
-        status: str,
-    ) -> None:
-        """Log one-line stage timing profile for current job."""
-        now_sec = rospy.Time.now().to_sec()
-        frame_age_ms = (now_sec - frame_stamp_sec) * 1000.0 if frame_stamp_sec > 0.0 else float("nan")
-        parts = [f"{k}={v:.2f}ms" for k, v in stage_times_ms]
-        rospy.loginfo(
-            "time_profile status=%s cmd_seq=%d frame_age=%.2fms caption='%s' %s",
-            status,
-            cmd_seq,
-            frame_age_ms,
-            caption,
-            " ".join(parts),
-        )
-
     def _worker_loop(self) -> None:
         """Consume latest queued jobs and run heavy GDINO+SAM+pointcloud processing."""
         while not rospy.is_shutdown() and not self.stop_event.is_set():
@@ -437,30 +596,15 @@ class FusionLidarCameraNode:
         caption = job["caption"]
         cmd_seq = int(job["cmd_seq"])
         queue_wait = rospy.Time.now().to_sec() - float(job["enqueue_wall_sec"])
-        t_total_start = time.perf_counter()
-        stage_times_ms: List[Tuple[str, float]] = [("queue_wait", queue_wait * 1000.0)]
-
-        def finish(status: str) -> None:
-            stage_times_ms.append(("total", (time.perf_counter() - t_total_start) * 1000.0))
-            self._log_stage_timing(
-                stage_times_ms=stage_times_ms,
-                frame_stamp_sec=frame_stamp_sec,
-                cmd_seq=cmd_seq,
-                caption=caption,
-                status=status,
-            )
 
         with self.state_lock:
             latest_cmd_seq = self.cmd_seq
         if cmd_seq != latest_cmd_seq:
-            finish("drop_cmd_seq")
             return
 
         if self._job_too_old(frame_stamp_sec, "queued job"):
-            finish("drop_queued_old")
             return
 
-        t_tf = time.perf_counter()
         try:
             self.tf_listener.waitForTransform(
                 self.goal_frame,
@@ -473,9 +617,7 @@ class FusionLidarCameraNode:
                 self.base_frame,
                 frame_stamp,
             )
-            stage_times_ms.append(("tf_lookup", (time.perf_counter() - t_tf) * 1000.0))
         except Exception as exc:
-            stage_times_ms.append(("tf_lookup", (time.perf_counter() - t_tf) * 1000.0))
             rospy.logwarn_throttle(
                 1.0,
                 "drop frame by TF mismatch: %s <- %s at stamp=%.6f | %s",
@@ -484,40 +626,30 @@ class FusionLidarCameraNode:
                 self._as_float_seconds(frame_stamp),
                 str(exc),
             )
-            finish("drop_tf")
             return
 
-        t_prep = time.perf_counter()
         base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
         image = camera_handle._ros_image_to_cv2_fallback(image_msg)
-        stage_times_ms.append(("prep_image", (time.perf_counter() - t_prep) * 1000.0))
 
-        t_detect = time.perf_counter()
         detections, labels = self.detecte_model.predict(
             image=image,
             caption=caption
         )
-        stage_times_ms.append(("detect", (time.perf_counter() - t_detect) * 1000.0))
         if len(detections.xyxy) == 0:
             rospy.logwarn("No detections for caption='%s'", caption)
-            finish("drop_no_detection")
             return
 
-        t_pick = time.perf_counter()
         conf = (
             np.asarray(detections.confidence, dtype=np.float32)
             if getattr(detections, "confidence", None) is not None
             else np.zeros((len(detections.xyxy),), dtype=np.float32)
         )
-        best_idx = int(np.argmax(conf))
+        best_idx = self.match_features(image, detections, conf)
         box_xyxy = detections.xyxy[best_idx]
         gdino_score = float(conf[best_idx]) if best_idx < len(conf) else 0.0
-        stage_times_ms.append(("select_box", (time.perf_counter() - t_pick) * 1000.0))
 
-        t_mask = time.perf_counter()
         if self.use_bbox_mask_only:
             mask = self._bbox_mask(image.shape[:2], box_xyxy)
-            stage_times_ms.append(("bbox_mask", (time.perf_counter() - t_mask) * 1000.0))
         else:
             mask, _, _ = self.sam_model.get_mask_by_box(
                 box_xyxy=box_xyxy,
@@ -525,30 +657,37 @@ class FusionLidarCameraNode:
                 image_format="BGR",
                 multimask_output=False,
             )
-            stage_times_ms.append(("sam", (time.perf_counter() - t_mask) * 1000.0))
         if self.mask_dilate_px > 0:
-            t_dilate = time.perf_counter()
             k = self.mask_dilate_px * 2 + 1
             kernel = np.ones((k, k), dtype=np.uint8)
             mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-            stage_times_ms.append(("mask_dilate", (time.perf_counter() - t_dilate) * 1000.0))
 
-        t_read_cloud = time.perf_counter()
-        xyzuv_inside = cloudpoints_handle._read_xyzuv(cloud_msg)
-        stage_times_ms.append(("read_xyzuv", (time.perf_counter() - t_read_cloud) * 1000.0))
-        if xyzuv_inside.shape[0] == 0:
+        xyz = cloudpoints_handle._read_xyz(cloud_msg)
+        if xyz.shape[0] == 0:
             rospy.logwarn("No points from %s", self.topic_visual_points)
-            finish("drop_no_xyzuv")
             return
+        
+        h, w = image.shape[:2]
+        xyz_proj, uv, _ = points_project.project_lidar_to_image_with_rational_polynomial(
+            xyz_lidar=xyz,
+            R_optical_lidar=points_project.R,
+            t_optical_lidar=points_project.T,
+            K_camera=self.K,
+            width=w,
+            height=h,
+            dist_coeffs=self.D,
+            min_depth=0.1,
+        )
+        if xyz_proj.shape[0] == 0:
+            rospy.logwarn_throttle(2.0, "no projected points inside image")
+            return
+      
+        # uv can be very close to image border; clip after rounding to avoid OOB.
+        u_inside = np.clip(np.rint(uv[:, 0]).astype(np.int32), 0, w - 1)
+        v_inside = np.clip(np.rint(uv[:, 1]).astype(np.int32), 0, h - 1)
 
-        t_filter_points = time.perf_counter()
-        u_inside = np.rint(xyzuv_inside[:, 3]).astype(np.int16)
-        v_inside = np.rint(xyzuv_inside[:, 4]).astype(np.int16)
-
-        on_object = mask[u_inside, v_inside]
-        object_xyzuv = xyzuv_inside[on_object]
-        object_xyz = object_xyzuv[:, :3] if object_xyzuv.shape[0] > 0 else np.zeros((0, 3), dtype=np.float32)
-        stage_times_ms.append(("mask_filter", (time.perf_counter() - t_filter_points) * 1000.0))
+        on_object = mask[v_inside, u_inside]
+        object_xyz = xyz_proj[on_object]
 
         if object_xyz.shape[0] < self.min_points:
             rospy.logwarn(
@@ -558,7 +697,6 @@ class FusionLidarCameraNode:
             )
 
 
-        t_cluster = time.perf_counter()
         if object_xyz.shape[0] > 0:
             min_points_per_cell, min_cluster_points = self._cluster_params(object_xyz.shape[0])
             center, nearest_surface_xy = cloudpoints_handle.cluster_2d_center_nearest_surface(
@@ -570,27 +708,29 @@ class FusionLidarCameraNode:
         else:
             center = np.array([np.nan, np.nan], dtype=np.float32)
             nearest_surface_xy = np.array([np.nan, np.nan], dtype=np.float32)
-        stage_times_ms.append(("cluster", (time.perf_counter() - t_cluster) * 1000.0))
 
+        center_ = np.array([-center[1], center[0]], dtype=np.float32)
+        nearest_surface_xy_ = np.array([-nearest_surface_xy[1], nearest_surface_xy[0]], dtype=np.float32)
         if self._job_too_old(frame_stamp_sec, "inference result"):
-            finish("drop_infer_old")
             return
 
-        t_payload = time.perf_counter()
         payload = self._get_payload(
             stamp_sec=self._as_float_seconds(image_msg.header.stamp),
             frame_id=cloud_msg.header.frame_id,
             caption=caption,
             box_xyxy=[float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])],
             gdino_score=gdino_score,
-            center=center,
-            nearest_surface_xy=nearest_surface_xy,
+            center=center_,
+            nearest_surface_xy=nearest_surface_xy_,
             num_points=object_xyz.shape[0],
         )
         self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
-        stage_times_ms.append(("publish_json", (time.perf_counter() - t_payload) * 1000.0))
 
-        t_debug = time.perf_counter()
+        if self.run == TaskState.Recognize:
+            self.run = TaskState.Notask
+            self.recovery.clear()
+            return
+        
         if self.enable_debug_overlay:
             annotated = self.detecte_model.annotate(image, detections, labels)
             debug = annotated
@@ -609,12 +749,7 @@ class FusionLidarCameraNode:
             self.pub_debug_image.publish(camera_handle._cv2_to_ros_image_fallback(debug, image_msg.header))
             self.pub_object_points.publish(cloudpoints_handle._build_cloud_xyz(cloud_msg.header, object_xyz))
 
-            if self.save_debug_images:
-                stamp_ns = str(image_msg.header.stamp.to_nsec())
-                cv2.imwrite(os.path.join(self.output_dir, f"{stamp_ns}_debug.jpg"), debug)
-        stage_times_ms.append(("debug_overlay", (time.perf_counter() - t_debug) * 1000.0))
 
-        t_goal = time.perf_counter()
         if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
             self._send_follow_goal(
                 center_xy=payload["centroid_xy_m"],
@@ -622,9 +757,160 @@ class FusionLidarCameraNode:
                 base_trans=(float(trans[0]), float(trans[1]), float(trans[2])),
                 base_yaw=base_yaw,
             )
-        stage_times_ms.append(("send_goal", (time.perf_counter() - t_goal) * 1000.0))
-        finish("ok")
 
+    def match_features(self, image, detections, conf):
+        if image is None:
+            return 0
+
+        n_det = len(detections.xyxy)
+        if n_det <= 0:
+            return 0
+
+        conf_arr = np.asarray(conf, dtype=np.float32).reshape(-1)
+        if conf_arr.shape[0] != n_det:
+            conf_arr = np.zeros((n_det,), dtype=np.float32)
+
+        # Stage-1 fast gating: confidence only.
+        fast_scores = conf_arr.copy()
+
+        # Periodic/global re-acquire to recover from wrong lock.
+        self.reacquire_counter += 1
+        force_global = (
+            self.low_identity_streak >= 2
+            or (self.reacquire_counter % 5 == 0)
+        )
+        if n_det <= 4 or force_global:
+            candidate_idxs = list(range(n_det))
+        else:
+            top_k = min(4, n_det)
+            candidate_idxs = np.argsort(-fast_scores)[:top_k].tolist()
+
+        if len(candidate_idxs) == 0:
+            return int(np.argmax(conf_arr)) if conf_arr.shape[0] > 0 else 0
+
+        # No identity template: fallback to fast gate only.
+        if self.image_target is None:
+            return int(candidate_idxs[0])
+
+        # Stage-2 identity scoring: XFeat + geometric inlier ratio.
+        h, w = image.shape[:2]
+        final_scores = {}
+        ransac_method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+        for i in candidate_idxs:
+            box = detections.xyxy[i]
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            try:
+                mkpts_0, mkpts_1 = self.xfeat.match_xfeat(self.image_target, crop)
+                id_score = 0.0
+                n_match = int(mkpts_0.shape[0]) if mkpts_0 is not None else 0
+                inliers = 0
+                if (
+                    mkpts_0 is not None
+                    and mkpts_1 is not None
+                    and mkpts_0.shape[0] >= 4
+                    and mkpts_1.shape[0] >= 4
+                ):
+                    _, inlier_mask = cv2.findHomography(
+                        mkpts_0.astype(np.float32),
+                        mkpts_1.astype(np.float32),
+                        ransac_method,
+                        3.0,
+                    )
+                    if inlier_mask is not None:
+                        inliers = int(inlier_mask.reshape(-1).sum())
+                        inlier_ratio = float(inliers) / float(max(n_match, 1))
+                        support = min(1.0, float(n_match) / 30.0)
+                        id_score = inlier_ratio * support
+            except Exception as exc:
+                rospy.logwarn_throttle(1.0, "XFeat match failed on det[%d]: %s", i, str(exc))
+                id_score = 0.0
+                n_match = 0
+                inliers = 0
+
+            hist_score = 0.0
+            if self.template_hs_hist is not None:
+                crop_hist = self._compute_hs_hist(crop)
+                if crop_hist is not None:
+                    corr = float(cv2.compareHist(self.template_hs_hist, crop_hist, cv2.HISTCMP_CORREL))
+                    hist_score = max(0.0, min(1.0, 0.5 * (corr + 1.0)))
+
+            final_score = (
+                0.70 * id_score
+                + 0.20 * hist_score
+                + 0.10 * float(conf_arr[i])
+            )
+            final_scores[i] = {
+                "final": float(final_score),
+                "id": float(id_score),
+                "hist": float(hist_score),
+                "conf": float(conf_arr[i]),
+                "matches": int(n_match),
+                "inliers": int(inliers),
+            }
+            rospy.loginfo(
+                "det[%d] score: final=%.4f conf=%.4f id=%.4f hist=%.4f m=%d inl=%d",
+                i,
+                final_scores[i]["final"],
+                final_scores[i]["conf"],
+                final_scores[i]["id"],
+                final_scores[i]["hist"],
+                final_scores[i]["matches"],
+                final_scores[i]["inliers"],
+            )
+
+        if len(final_scores) == 0:
+            return int(candidate_idxs[0])
+
+        ranked = sorted(final_scores.items(), key=lambda kv: kv[1]["final"], reverse=True)
+        best_idx = int(ranked[0][0])
+
+        # Force switch to the strongest identity candidate when evidence is clear.
+        if len(final_scores) >= 2:
+            top_final_idx = int(ranked[0][0])
+            best_id_idx = max(final_scores.keys(), key=lambda k: final_scores[k]["id"])
+            top_final_id = float(final_scores[top_final_idx]["id"])
+            best_id = float(final_scores[best_id_idx]["id"])
+            best_hist = float(final_scores[best_id_idx]["hist"])
+            if (
+                best_id_idx != top_final_idx
+                and best_id >= 0.18
+                and best_hist >= 0.25
+                and (best_id - top_final_id) >= 0.05
+            ):
+                best_idx = int(best_id_idx)
+                rospy.loginfo(
+                    "identity override: top_final_idx=%d top_final_id=%.3f -> best_id_idx=%d best_id=%.3f best_hist=%.3f",
+                    top_final_idx,
+                    top_final_id,
+                    int(best_id_idx),
+                    best_id,
+                    best_hist,
+                )
+
+        # Global re-acquire trigger when identity evidence stays weak for several frames.
+        chosen_id = final_scores.get(best_idx, {}).get("id", 0.0)
+        chosen_hist = final_scores.get(best_idx, {}).get("hist", 0.0)
+        if chosen_id < 0.06 and chosen_hist < 0.25:
+            self.low_identity_streak += 1
+        else:
+            self.low_identity_streak = 0
+        if self.low_identity_streak >= 4:
+            self.low_identity_streak = 0
+            rospy.logwarn("identity weak for several frames, trigger global reacquire")
+
+        return best_idx
+    
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""
         lidar_sec = self._as_float_seconds(cloud_msg.header.stamp)
@@ -650,20 +936,21 @@ class FusionLidarCameraNode:
             cmd_seq = self.cmd_seq
             caption = self.detecte_model.caption
 
-            if run_mode not in (RECON, FOLLOW):
+            if run_mode not in (TaskState.Follow_once, TaskState.Follow, TaskState.Recognize):
                 return
 
             if cmd_stamp != rospy.Time(0) and frame_stamp != rospy.Time(0) and frame_stamp < cmd_stamp:
                 return
 
-            if run_mode == FOLLOW and self.max_infer_fps > 0.0:
+            if run_mode == TaskState.Follow and self.max_infer_fps > 0.0:
                 min_dt = 1.0 / self.max_infer_fps
                 if self.last_infer_stamp_sec > 0.0 and (frame_stamp_sec - self.last_infer_stamp_sec) < min_dt:
                     return
                 self.last_infer_stamp_sec = frame_stamp_sec
 
-            if run_mode == RECON:
-                self.run = NOTASK
+            if  run_mode == TaskState.Follow_once:
+                self.run = TaskState.Notask
+                self.recovery.clear()
 
         job = {
             "image_msg": image_msg,
