@@ -25,9 +25,9 @@ from tf.transformations import quaternion_from_euler
 
 
 
-from camdepthfusion import points_project
-from camdepthfusion import cloudpoints_handle
-from camdepthfusion import camera_handle
+from camdepthfusion.project_cloudpoints import points_project
+from camdepthfusion.project_cloudpoints import cloudpoints_handle
+from camdepthfusion.camera_op import camera_handle
 
 NOTASK = 0
 FOLLOW = 1

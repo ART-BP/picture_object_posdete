@@ -5,9 +5,9 @@ import rospy
 from sensor_msgs.msg import Image
 
 try:
-    from camdepthfusion import camera_handle
+    from camdepthfusion.camera_op import camera_handle
 except ImportError:
-    import camera_handle
+    import camdepthfusion.camera_op.camera_handle as camera_handle
 
 
 save_requested = False

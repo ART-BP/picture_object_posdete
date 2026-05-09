@@ -20,7 +20,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from camdepthfusion.camera_handle import DEFAULT_CAMERA_PARAM_YAML, load_camera_params_from_yaml
+from camdepthfusion.camera_op.camera_handle import DEFAULT_CAMERA_PARAM_YAML, load_camera_params_from_yaml
 
 
 class GroundingDINORos(GroundingDINO):

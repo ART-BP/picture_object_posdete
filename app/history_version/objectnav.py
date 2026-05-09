@@ -27,9 +27,9 @@ from geometry_msgs.msg import Quaternion
 import tf
 from tf.transformations import quaternion_from_euler
 
-from camdepthfusion import points_project
-from camdepthfusion import cloudpoints_handle
-from camdepthfusion import camera_handle
+from camdepthfusion.project_cloudpoints import points_project
+from camdepthfusion.project_cloudpoints import cloudpoints_handle
+from camdepthfusion.camera_op import camera_handle
 from app.recovery import RecoveryAction, RecoveryController
 
 

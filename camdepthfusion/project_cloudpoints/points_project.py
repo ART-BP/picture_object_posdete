@@ -6,10 +6,9 @@ from typing import Any, Dict
 
 import cv2
 import numpy as np
-from camdepthfusion.camera_handle import _estimate_fisheye_theta_limit
-
+from camdepthfusion.camera_op.camera_handle import _estimate_fisheye_theta_limit
 MAX_OVERLAY_POINTS = 20000
-POINT_RADIUS = 3
+POINT_RADIUS = 1
 MIN_DEPTH = 0.1
 MIN_OBJECT_POINTS = 5
 
@@ -28,49 +27,30 @@ AXIS_REMAP = np.array(
     dtype=np.float64,
 ).reshape(3, 3)
 
-# R = np.array(
-#     [
-#         0.0,
-#         -1.0,
-#         0.0,
-#         0.0,
-#         0.0,
-#         -1.0,
-#         1.0,
-#         0.0,
-#         0.0,
-#     ],
-#     dtype=np.float64,
-# ).reshape(3, 3)
-
-# T = np.array([0.05, 0.08, 0.182], dtype=np.float64)
-
-
-# R = np.array(
-#     [
-#         -0.999845,
-#         -0.0170878,
-#         0.00420421,
-#         -0.0043689,
-#         0.00773508,
-#         -0.999961,
-#         0.0170546,
-#         -0.999824,
-#         -0.00780799,
-#     ],
-#     dtype=np.float64,
-# ).reshape(3, 3)
-
-# T = np.array([0.102544, -0.061073, -0.078117], dtype=np.float64)
-
 
 R = np.array([
-    [ -0.999957,  0.007163,  0.005963],
-    [-0.005932,  0.004424, -0.999973],
-    [-0.007190, -0.999965, -0.004381]
+    [-0.999972,  0.004859,  0.005607],
+    [-0.005586,  0.004351, -0.999975],
+    [-0.004883, -0.999979, -0.004323]
 ], dtype=np.float64)
 
-T = np.array([0.017952, -0.097494, -0.175946], dtype=np.float64)
+T = np.array([0.012069, -0.097637, -0.175698], dtype=np.float64)
+
+# R = np.array([
+#     [-0.999956,  0.007170,  0.005971],
+#     [-0.005939,  0.004404, -0.999973],
+#     [-0.007196, -0.999965, -0.004362]
+# ], dtype=np.float64)
+
+# T = np.array([0.017970, -0.097543, -0.175949], dtype=np.float64)
+
+# R = np.array([
+#     [ -0.999957,  0.007163,  0.005963],
+#     [-0.005932,  0.004424, -0.999973],
+#     [-0.007190, -0.999965, -0.004381]
+# ], dtype=np.float64)
+
+# T = np.array([0.017952, -0.097494, -0.175946], dtype=np.float64)
 
 def project_lidar_to_image(
     xyz_lidar: np.ndarray,
@@ -90,17 +70,25 @@ def project_lidar_to_image(
             np.zeros((0,), dtype=np.float32),
         )
 
-    xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
-    valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    if not np.any(valid):
+    mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    if not np.any(mask):
         return (
             np.zeros((0, 3), dtype=np.float32),
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
+    xyz_lidar_valid = xyz_lidar[mask]
+    xyz_cam = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
+    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
+    # if not np.any(valid):
+    #     return (
+    #         np.zeros((0, 3), dtype=np.float32),
+    #         np.zeros((0, 2), dtype=np.float32),
+    #         np.zeros((0,), dtype=np.float32),
+    #     )
 
-    xyz_lidar_valid = xyz_lidar[valid]
-    xyz_cam = xyz_cam[valid]
+    # xyz_lidar_valid = xyz_lidar[valid]
+    # xyz_cam = xyz_cam[valid]
 
     # Keep D for compatibility; projection assumes undistorted image.
     _ = dist_coeffs
@@ -147,18 +135,18 @@ def project_lidar_to_image_with_distortion(
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
+    xyz_lidar_valid = xyz_lidar[xyz_lidar[:, 1] < -0.2]
+    xyz_cam = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
+    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
+    # if not np.any(valid):
+    #     return (
+    #         np.zeros((0, 3), dtype=np.float32),
+    #         np.zeros((0, 2), dtype=np.float32),
+    #         np.zeros((0,), dtype=np.float32),
+    #     )
 
-    xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
-    valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    if not np.any(valid):
-        return (
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0, 2), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-        )
-
-    xyz_lidar_valid = xyz_lidar[valid]
-    xyz_cam = xyz_cam[valid].astype(np.float64, copy=False)
+    # xyz_lidar_valid = xyz_lidar[valid]
+    # xyz_cam = xyz_cam[valid].astype(np.float64, copy=False)
     K_use = np.asarray(K_camera, dtype=np.float64).reshape(3, 3)
     D_use = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
 
@@ -209,11 +197,11 @@ def project_lidar_to_image_with_rational_polynomial(
     thin-prism/tilt terms (12 or 14 total terms).
     """
     D_all = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
-    # if D_all.size < 8:
-    #     raise ValueError(
-    #         "rational_polynomial requires at least 8 coefficients "
-    #         "[k1, k2, p1, p2, k3, k4, k5, k6]"
-    #     )
+    if D_all.size < 8:
+        raise ValueError(
+            "rational_polynomial requires at least 8 coefficients "
+            "[k1, k2, p1, p2, k3, k4, k5, k6]"
+        )
 
     # OpenCV projectPoints commonly accepts distortion lengths 4/5/8/12/14.
     # For rational_polynomial, normalize to 8/12/14 to keep behavior stable.
@@ -263,18 +251,25 @@ def project_lidar_to_image_with_fisheye_distortion(
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-
-    xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
-    valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    if not np.any(valid):
+    mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    if not np.any(mask):
         return (
             np.zeros((0, 3), dtype=np.float32),
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-
-    xyz_lidar_valid = xyz_lidar[valid]
-    xyz_cam_valid = xyz_cam[valid].astype(np.float64, copy=False)
+    xyz_lidar_valid = xyz_lidar[mask]
+    # xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
+    xyz_cam_valid = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
+    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
+    # if not np.any(valid):
+    #     return (
+    #         np.zeros((0, 3), dtype=np.float32),
+    #         np.zeros((0, 2), dtype=np.float32),
+    #         np.zeros((0,), dtype=np.float32),
+    #     )
+    # xyz_lidar_valid = xyz_lidar[valid]
+    # xyz_cam_valid = xyz_cam[valid].astype(np.float64, copy=False)
 
     theta_limit = _estimate_fisheye_theta_limit(
         K_camera=K_camera,

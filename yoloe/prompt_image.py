@@ -1,5 +1,5 @@
 from yoloe import Yoloe
-from camdepthfusion import camera_handle
+from camdepthfusion.camera_op import camera_handle
 import rospy
 from sensor_msgs.msg import Image
 from pathlib import Path

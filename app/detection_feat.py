@@ -26,9 +26,9 @@ from geometry_msgs.msg import Quaternion
 import tf
 from tf.transformations import quaternion_from_euler
 
-from camdepthfusion import points_project
-from camdepthfusion import cloudpoints_handle
-from camdepthfusion import camera_handle
+from camdepthfusion.project_cloudpoints import points_project
+from camdepthfusion.project_cloudpoints import cloudpoints_handle
+from camdepthfusion.camera_op import camera_handle
 from app.recovery import RecoveryAction, RecoveryController
 from accelerated_features.modules.xfeat import XFeat
 from app.params_load import _load_runtime_config, _cfg_get
@@ -644,7 +644,7 @@ class FusionLidarCameraNode:
             if getattr(detections, "confidence", None) is not None
             else np.zeros((len(detections.xyxy),), dtype=np.float32)
         )
-        best_idx = self.match_features(image, detections, conf)
+        best_idx = np.argmax(conf)
         box_xyxy = detections.xyxy[best_idx]
         gdino_score = float(conf[best_idx]) if best_idx < len(conf) else 0.0
 
@@ -741,7 +741,7 @@ class FusionLidarCameraNode:
             line3 = f"num_points={payload['num_points']}"
             line4 = f"gdino_score={payload['gdino_score']}"
             x, y0, dy = 20, 40, 30
-            font, scale, color, thick  = cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
+            font, scale, color, thick  = cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
             cv2.putText(debug, line1, (x, y0 + 0 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line2, (x, y0 + 1 * dy), font, scale, color, thick, cv2.LINE_AA)
             cv2.putText(debug, line3, (x, y0 + 2 * dy), font, scale, color, thick, cv2.LINE_AA)

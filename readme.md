@@ -126,13 +126,13 @@
 
 ### 6.1 点云-图像融合
 
-1. 使用 [`camdepthfusion/points_project.py`](camdepthfusion/points_project.py) 中外参 `R/T` 将 LiDAR 点转换到相机坐标。
+1. 使用 [`camdepthfusion/project_cloudpoints/points_project.py`](camdepthfusion/project_cloudpoints/points_project.py) 中外参 `R/T` 将 LiDAR 点转换到相机坐标。
 2. 按 `rational_polynomial` 畸变模型投影到像素坐标。
 3. 用目标 mask 在像素平面筛选对应三维点。
 
 ### 6.2 聚类与目标点
 
-`cluster_2d_center_nearest_surface`（[`cloudpoints_handle.py`](camdepthfusion/cloudpoints_handle.py)）在 XY 平面做网格聚类，输出：
+`cluster_2d_center_nearest_surface`（[`cloudpoints_handle.py`](camdepthfusion/project_cloudpoints/cloudpoints_handle.py)）在 XY 平面做网格聚类，输出：
 
 1. 主连通簇中位数中心（用于目标方位）。
 2. 最近表面点（用于安全距离与靠近控制）。
@@ -256,4 +256,3 @@ rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"cancel\",\"capti
    - LiDAR-相机外参
    - 文本提示词有效性
 3. `move_base` 不可用时，节点仍可做感知与 JSON 输出，但无法执行跟随动作。
-

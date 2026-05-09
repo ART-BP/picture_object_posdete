@@ -6,9 +6,9 @@ import rospy
 from sensor_msgs.msg import Image, PointCloud2
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
-from camdepthfusion import camera_handle
-from camdepthfusion import cloudpoints_handle
-from camdepthfusion import points_project
+from camdepthfusion.camera_op import camera_handle
+from camdepthfusion.project_cloudpoints import cloudpoints_handle
+from camdepthfusion.project_cloudpoints import points_project
 
 
 class LidarImageTester:

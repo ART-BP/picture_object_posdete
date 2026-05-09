@@ -2,6 +2,7 @@ import numpy as np
 from sensor_msgs.msg import PointCloud2, PointField
 from typing import List, Tuple
 import sensor_msgs.point_cloud2 as pc2
+import re
 
 def _read_xyz(cloud_msg: PointCloud2) -> np.ndarray:
     field_map = {f.name: f for f in cloud_msg.fields}
@@ -150,6 +151,62 @@ def _read_xyzuv(cloud_msg: PointCloud2) -> np.ndarray:
     
     xyzuv = np.stack((x, y, z, u, v), axis=1).astype(np.float32, copy=False)
     return xyzuv
+
+
+def _crop_xyz_by_condition(xyz: np.ndarray, condition: str) -> np.ndarray:
+    """Crop XYZ points using simple axis conditions.
+
+    Supported syntax:
+    - Single condition: ``x < 0`` / ``z >= 1.2`` / ``y != 0``
+    - Multi condition (AND): ``x < 0 & z > 0.2`` (``and`` is also accepted)
+    """
+    pts = np.asarray(xyz, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError(f"Expected Nx3 points, got shape={pts.shape}")
+    if pts.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    expr = str(condition or "").strip()
+    if expr == "":
+        return pts[:, :3].astype(np.float32, copy=False)
+
+    expr = expr.replace(" and ", " & ")
+    clauses = [c.strip() for c in expr.split("&") if c.strip()]
+    if not clauses:
+        return pts[:, :3].astype(np.float32, copy=False)
+
+    # Clause grammar: <axis><op><number>, e.g. x<0, z>=1.5
+    pattern = re.compile(
+        r"^\s*([xyzXYZ])\s*(<=|>=|<|>|==|!=)\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$"
+    )
+
+    axis_map = {
+        "x": pts[:, 0],
+        "y": pts[:, 1],
+        "z": pts[:, 2],
+    }
+    op_map = {
+        "<": np.less,
+        "<=": np.less_equal,
+        ">": np.greater,
+        ">=": np.greater_equal,
+        "==": np.equal,
+        "!=": np.not_equal,
+    }
+
+    mask = np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1]) & np.isfinite(pts[:, 2])
+    for clause in clauses:
+        m = pattern.match(clause)
+        if m is None:
+            raise ValueError(
+                f"Invalid crop clause '{clause}'. Supported form: x<0, y>=1.2, z!=0"
+            )
+        axis = m.group(1).lower()
+        op = m.group(2)
+        value = float(m.group(3))
+        mask = mask & op_map[op](axis_map[axis], value)
+
+    return pts[mask, :3].astype(np.float32, copy=False)
 
 
 def _build_cloud_xyzuv(header, xyz: np.ndarray, uv: np.ndarray) -> PointCloud2:
