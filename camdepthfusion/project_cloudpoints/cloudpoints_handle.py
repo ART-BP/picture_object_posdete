@@ -318,3 +318,98 @@ def cluster_2d_center_nearest_surface(
     nearest_idx = int(np.argmin(np.sum(cluster_pts * cluster_pts, axis=1)))
     nearest_xy = cluster_pts[nearest_idx].astype(np.float32)
     return center, nearest_xy
+
+
+def cluster_3d_center_nearest_surface(
+    points_xyz: np.ndarray,
+    grid_size: float = 0.1,
+    z_grid_size: float = 0.6,
+    min_points_per_cell: int = 2,
+    min_cluster_points: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cluster 3D points and return (median center, nearest surface point)."""
+    if points_xyz is None:
+        nan_xyz = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+        return nan_xyz, nan_xyz.copy()
+
+    pts = np.asarray(points_xyz, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError(f"Expected Nx3 points, got shape={pts.shape}")
+    if pts.shape[1] > 3:
+        pts = pts[:, :3]
+    if pts.shape[0] == 0:
+        nan_xyz = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+        return nan_xyz, nan_xyz.copy()
+
+    if grid_size <= 0:
+        raise ValueError(f"grid_size must be > 0, got {grid_size}")
+    if z_grid_size <= 0:
+        raise ValueError(f"z_grid_size must be > 0, got {z_grid_size}")
+
+    cell_size = np.array([float(grid_size), float(grid_size), float(z_grid_size)], dtype=np.float32)
+    cell_points = np.floor(pts / cell_size).astype(np.int32)
+    unique_cells, counts = np.unique(cell_points, axis=0, return_counts=True)
+
+    dense_mask = counts >= max(1, int(min_points_per_cell))
+    if not np.any(dense_mask):
+        center = np.median(pts, axis=0).astype(np.float32)
+        # Same ordering as norm(), but avoids sqrt for better speed.
+        nearest_idx = int(np.argmin(np.sum(pts * pts, axis=1)))
+        nearest_xyz = pts[nearest_idx].astype(np.float32)
+        return center, nearest_xyz
+
+    dense_cells = unique_cells[dense_mask]
+    dense_set = {tuple(c.tolist()) for c in dense_cells}
+    cell_count = {tuple(c.tolist()): int(n) for c, n in zip(unique_cells, counts)}
+
+    visited = set()
+    best_component_cells = set()
+    best_component_points = 0
+
+    for cell_arr in dense_cells:
+        start = tuple(cell_arr.tolist())
+        if start in visited:
+            continue
+
+        stack = [start]
+        visited.add(start)
+        component_cells = set()
+        component_points = 0
+
+        while stack:
+            cx, cy, cz = stack.pop()
+            cell = (cx, cy, cz)
+            component_cells.add(cell)
+            component_points += cell_count.get(cell, 0)
+
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        nxt = (cx + dx, cy + dy, cz + dz)
+                        if nxt in dense_set and nxt not in visited:
+                            visited.add(nxt)
+                            stack.append(nxt)
+
+        if component_points > best_component_points:
+            best_component_points = component_points
+            best_component_cells = component_cells
+
+    if not best_component_cells:
+        cluster_pts = pts
+    else:
+        keep = np.fromiter(
+            (tuple(c.tolist()) in best_component_cells for c in cell_points),
+            dtype=np.bool_,
+            count=cell_points.shape[0],
+        )
+        cluster_pts = pts[keep]
+        if cluster_pts.shape[0] < max(1, int(min_cluster_points)):
+            cluster_pts = pts
+
+    center = np.median(cluster_pts, axis=0).astype(np.float32)
+    # Same ordering as norm(), but avoids sqrt for better speed.
+    nearest_idx = int(np.argmin(np.sum(cluster_pts * cluster_pts, axis=1)))
+    nearest_xyz = cluster_pts[nearest_idx].astype(np.float32)
+    return center, nearest_xyz
