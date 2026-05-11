@@ -38,6 +38,7 @@ class TaskState(IntEnum):
     Follow = 1
     Recognize = 2
     Follow_once = 3
+    Recognize_once = 4
 
 
 class FusionLidarCameraNode:
@@ -50,12 +51,21 @@ class FusionLidarCameraNode:
             "output_fusion",
         )
 
-        params = camera_handle.load_camera_params_from_yaml(camera_model="rational_polynomial")  # For logging camera params and compatibility check
+        params = camera_handle.load_camera_params_from_yaml(camera_model="fisheye")  # For logging camera params and compatibility check
         self.K = np.asarray(params["K"],dtype=np.float64)
         self.D = np.asarray(params["D"],dtype=np.float64)
 
         self.topic_image = _cfg_get(cfg, "topic_image", "/camera/go2/front/image_raw", str)
         self.topic_points = _cfg_get(cfg, "topic_points", "/lidar_points", str)
+
+        if self.topic_points.endswith("loc_scan_undistort"):
+            self.R = points_project.R_base_cam
+            self.T = points_project.T_base_cam
+            self.points_undisort = True
+        else:
+            self.R = points_project.R
+            self.T = points_project.T
+            self.points_undisort = False
 
         caption = _cfg_get(cfg, "caption", "black box", str)
         box_threshold = _cfg_get(cfg, "box_threshold", 0.55, float)
@@ -70,6 +80,7 @@ class FusionLidarCameraNode:
         self.cluster_min_points_sparse = _cfg_get(cfg, "cluster_min_points_sparse", 5, int)
         self.cluster_min_cell_dense = _cfg_get(cfg, "cluster_min_cell_dense", 5, int)
         self.cluster_min_points_dense = _cfg_get(cfg, "cluster_min_points_dense", 10, int)
+        self.cluster_z_grid_size = _cfg_get(cfg, "cluster_z_grid_size", 0.6, float)
         self.min_goal_dist_m = _cfg_get(cfg, "min_goal_dist_m", 0.5, float)
         self.goal_frame = _cfg_get(cfg, "goal_frame", "map", str)
         self.base_frame = _cfg_get(cfg, "base_frame", "base_link", str)
@@ -142,7 +153,7 @@ class FusionLidarCameraNode:
         )
         self.recovery_thread.start()
 
-        self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/debug_image", Image, queue_size=1, latch=True)
+        self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/image", Image, queue_size=1, latch=True)
         self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
         self.pub_depth_json = rospy.Publisher("/fusion_lidar_camera/object_depth_json", String, latch=True, queue_size=2)
 
@@ -214,18 +225,25 @@ class FusionLidarCameraNode:
             elif task == "recognition":
                 self.run = TaskState.Recognize
                 self.cmd_stamp = now
+            elif task == "recognition_once":
+                self.run = TaskState.Recognize_once
+                self.cmd_stamp = now
             elif task == "follow_once":
                 self.run = TaskState.Follow_once
                 self.cmd_stamp = now
+            elif task == "cancel":
+                self.run = TaskState.Notask
+                self.cmd_stamp = rospy.Time(0)
             else:
                 self.run = TaskState.Notask
+                self.cmd_stamp = rospy.Time(0)
 
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
 
         self.recovery.on_task(task=task, now_sec=now_sec)
 
-        if task in ("follow", "recognition", "follow_once"):
+        if task in ("follow", "recognition", "recognition_once", "follow_once"):
             self._ensure_worker_started()
 
         if task == "cancel":
@@ -501,6 +519,20 @@ class FusionLidarCameraNode:
         cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
         return hist
 
+    @staticmethod
+    def _transform_base_xyz_to_global(
+        xyz_base: np.ndarray,
+        base_trans: Tuple[float, float, float],
+        base_rot,
+    ) -> np.ndarray:
+        xyz = np.asarray(xyz_base, dtype=np.float32)
+        if xyz.shape[0] < 3 or not np.all(np.isfinite(xyz[:3])):
+            return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+        rot_matrix = tf.transformations.quaternion_matrix(base_rot)[:3, :3]
+        trans = np.asarray(base_trans, dtype=np.float32)
+        return (rot_matrix @ xyz[:3].astype(np.float64) + trans.astype(np.float64)).astype(np.float32)
+
     def _get_payload(
         self,
         stamp_sec: float,
@@ -509,49 +541,90 @@ class FusionLidarCameraNode:
         box_xyxy: List[float],
         gdino_score: float,
         center: np.ndarray,
-        nearest_surface_xy: np.ndarray,
+        center_global_xyz: np.ndarray,
+        nearest_surface_xyz: np.ndarray,
+        nearest_surface_global_xyz: np.ndarray,
+        base_global_xyz: np.ndarray,
         num_points: int,
-    ) -> dict:
+    ) -> Optional[dict]:
         """Build JSON payload for object center and nearest surface point."""
         center_arr = np.asarray(center, dtype=np.float32) if center is not None else None
+        center_global_arr = (
+            np.asarray(center_global_xyz, dtype=np.float32)
+            if center_global_xyz is not None
+            else None
+        )
         nearest_arr = (
-            np.asarray(nearest_surface_xy, dtype=np.float32)
-            if nearest_surface_xy is not None
+            np.asarray(nearest_surface_xyz, dtype=np.float32)
+            if nearest_surface_xyz is not None
+            else None
+        )
+        nearest_global_arr = (
+            np.asarray(nearest_surface_global_xyz, dtype=np.float32)
+            if nearest_surface_global_xyz is not None
+            else None
+        )
+        base_global_arr = (
+            np.asarray(base_global_xyz, dtype=np.float32)
+            if base_global_xyz is not None
             else None
         )
         valid_center = (
             center_arr is not None
-            and center_arr.shape[0] >= 2
-            and np.all(np.isfinite(center_arr[:2]))
+            and center_arr.shape[0] >= 3
+            and np.all(np.isfinite(center_arr[:3]))
+        )
+        valid_center_global = (
+            center_global_arr is not None
+            and center_global_arr.shape[0] >= 3
+            and np.all(np.isfinite(center_global_arr[:3]))
         )
         valid_nearest = (
             nearest_arr is not None
-            and nearest_arr.shape[0] >= 2
-            and np.all(np.isfinite(nearest_arr[:2]))
+            and nearest_arr.shape[0] >= 3
+            and np.all(np.isfinite(nearest_arr[:3]))
         )
-        if num_points < self.min_points or not valid_center or not valid_nearest:
-            return {
-                "stamp": stamp_sec,
-                "frame_id": frame_id,
-                "caption": caption,
-                "bbox_xyxy": box_xyxy,
-                "gdino_score": gdino_score,
-                "num_points": int(num_points),
-                "centroid_xy_m": None,
-                "nearest_surface_xy_m": None,
-                "nearest_surface_dist_m": None,
-            }
+        valid_nearest_global = (
+            nearest_global_arr is not None
+            and nearest_global_arr.shape[0] >= 3
+            and np.all(np.isfinite(nearest_global_arr[:3]))
+        )
+        valid_base_global = (
+            base_global_arr is not None
+            and base_global_arr.shape[0] >= 3
+            and np.all(np.isfinite(base_global_arr[:3]))
+        )
 
-        nearest_dist = float(np.linalg.norm(nearest_arr[:2]))
+        if (
+            num_points < self.min_points
+            or not valid_center
+            or not valid_nearest
+            or not valid_center_global
+            or not valid_nearest_global
+            or not valid_base_global
+        ):
+            return None
+
+        nearest_dist = float(np.linalg.norm(nearest_global_arr[:3] - base_global_arr[:3]))
         return {
             "stamp": stamp_sec,
             "frame_id": frame_id,
+            "base_frame": self.base_frame,
+            "global_frame": self.goal_frame,
             "caption": caption,
             "bbox_xyxy": box_xyxy,
             "gdino_score": gdino_score,
             "num_points": int(num_points),
-            "centroid_xy_m": [float(center_arr[0]), float(center_arr[1])],
-            "nearest_surface_xy_m": [float(nearest_arr[0]), float(nearest_arr[1])],
+            "centroid_xyz_m": [
+                float(center_global_arr[0]),
+                float(center_global_arr[1]),
+                float(center_global_arr[2]),
+            ],
+            "nearest_surface_xyz_m": [
+                float(nearest_global_arr[0]),
+                float(nearest_global_arr[1]),
+                float(nearest_global_arr[2]),
+            ],
             "nearest_surface_dist_m": nearest_dist,
         }
     
@@ -595,6 +668,7 @@ class FusionLidarCameraNode:
         frame_stamp_sec = float(job["frame_stamp_sec"])
         caption = job["caption"]
         cmd_seq = int(job["cmd_seq"])
+        run_mode = TaskState(int(job["run_mode"]))
         queue_wait = rospy.Time.now().to_sec() - float(job["enqueue_wall_sec"])
 
         with self.state_lock:
@@ -629,6 +703,8 @@ class FusionLidarCameraNode:
             return
 
         base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
+        base_trans = (float(trans[0]), float(trans[1]), float(trans[2]))
+        base_global_xyz = np.array([base_trans[0], base_trans[1], base_trans[2]], dtype=np.float32)
         image = camera_handle._ros_image_to_cv2_fallback(image_msg)
 
         detections, labels = self.detecte_model.predict(
@@ -664,19 +740,19 @@ class FusionLidarCameraNode:
 
         xyz = cloudpoints_handle._read_xyz(cloud_msg)
         if xyz.shape[0] == 0:
-            rospy.logwarn("No points from %s", self.topic_visual_points)
+            rospy.logwarn("No points from %s", self.topic_points)
             return
         
         h, w = image.shape[:2]
-        xyz_proj, uv, _ = points_project.project_lidar_to_image_with_rational_polynomial(
+        xyz_proj, uv, _ = points_project.project_lidar_to_image_with_fisheye_distortion(
             xyz_lidar=xyz,
-            R_optical_lidar=points_project.R,
-            t_optical_lidar=points_project.T,
+            R_optical_lidar=self.R,
+            t_optical_lidar=self.T,
             K_camera=self.K,
             width=w,
             height=h,
             dist_coeffs=self.D,
-            min_depth=0.1,
+            undisort_points=self.points_undisort,
         )
         if xyz_proj.shape[0] == 0:
             rospy.logwarn_throttle(2.0, "no projected points inside image")
@@ -699,18 +775,28 @@ class FusionLidarCameraNode:
 
         if object_xyz.shape[0] > 0:
             min_points_per_cell, min_cluster_points = self._cluster_params(object_xyz.shape[0])
-            center, nearest_surface_xy = cloudpoints_handle.cluster_2d_center_nearest_surface(
-                object_xyz[:, :2],
+            center, nearest_surface_xyz = cloudpoints_handle.cluster_3d_center_nearest_surface(
+                object_xyz,
                 grid_size=self.cluster_grid_size,
+                z_grid_size=self.cluster_z_grid_size,
                 min_points_per_cell=min_points_per_cell,
                 min_cluster_points=min_cluster_points,
             )
         else:
-            center = np.array([np.nan, np.nan], dtype=np.float32)
-            nearest_surface_xy = np.array([np.nan, np.nan], dtype=np.float32)
+            center = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+            nearest_surface_xyz = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
 
-        center_ = np.array([-center[1], center[0]], dtype=np.float32)
-        nearest_surface_xy_ = np.array([-nearest_surface_xy[1], nearest_surface_xy[0]], dtype=np.float32)
+        center_base_xyz = np.array([-center[1], center[0], center[2]], dtype=np.float32)
+        nearest_surface_base_xyz = np.array(
+            [-nearest_surface_xyz[1], nearest_surface_xyz[0], nearest_surface_xyz[2]],
+            dtype=np.float32,
+        )
+        center_global_xyz = self._transform_base_xyz_to_global(center_base_xyz, base_trans, rot)
+        nearest_surface_global_xyz = self._transform_base_xyz_to_global(
+            nearest_surface_base_xyz,
+            base_trans,
+            rot,
+        )
         if self._job_too_old(frame_stamp_sec, "inference result"):
             return
 
@@ -720,26 +806,38 @@ class FusionLidarCameraNode:
             caption=caption,
             box_xyxy=[float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])],
             gdino_score=gdino_score,
-            center=center_,
-            nearest_surface_xy=nearest_surface_xy_,
+            center=center_base_xyz,
+            center_global_xyz=center_global_xyz,
+            nearest_surface_xyz=nearest_surface_base_xyz,
+            nearest_surface_global_xyz=nearest_surface_global_xyz,
+            base_global_xyz=base_global_xyz,
             num_points=object_xyz.shape[0],
         )
-        self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
-
-        if self.run == TaskState.Recognize:
-            self.run = TaskState.Notask
-            self.recovery.clear()
+        if payload is None:
+            rospy.logwarn_throttle(1.0, "skip object publish: invalid object geometry")
             return
+
+        with self.state_lock:
+            current_run = self.run
+            current_cmd_seq = self.cmd_seq
+
+        if current_cmd_seq != cmd_seq:
+            return
+
+        if run_mode in (TaskState.Follow, TaskState.Recognize) and current_run != run_mode:
+            return
+
+        self.pub_depth_json.publish(String(data=json.dumps(payload, ensure_ascii=False)))
         
         if self.enable_debug_overlay:
             annotated = self.detecte_model.annotate(image, detections, labels)
             debug = annotated
             debug[mask] = (debug[mask] * 0.6 + np.array([0, 255, 0], dtype=np.float32) * 0.4).astype(np.uint8)
 
-            line1 = f"center={payload['centroid_xy_m']}"
-            line2 = f"nearest={payload['nearest_surface_xy_m']}"
-            line3 = f"num_points={payload['num_points']}"
-            line4 = f"gdino_score={payload['gdino_score']}"
+            line1 = f"center={payload['centroid_xyz_m']}"
+            line2 = f"nearest={payload['nearest_surface_xyz_m']}"
+            line3 = f"dist={payload['nearest_surface_dist_m']}"
+            line4 = f"num_points={payload['num_points']} gdino_score={payload['gdino_score']}"
             x, y0, dy = 20, 40, 30
             font, scale, color, thick  = cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
             cv2.putText(debug, line1, (x, y0 + 0 * dy), font, scale, color, thick, cv2.LINE_AA)
@@ -750,11 +848,15 @@ class FusionLidarCameraNode:
             self.pub_object_points.publish(cloudpoints_handle._build_cloud_xyz(cloud_msg.header, object_xyz))
 
 
-        if payload["centroid_xy_m"] is not None and payload["nearest_surface_xy_m"] is not None:
+        if (
+            run_mode in (TaskState.Follow, TaskState.Follow_once)
+            and np.all(np.isfinite(center_base_xyz[:2]))
+            and np.all(np.isfinite(nearest_surface_base_xyz[:2]))
+        ):
             self._send_follow_goal(
-                center_xy=payload["centroid_xy_m"],
-                surface_xy=payload["nearest_surface_xy_m"],
-                base_trans=(float(trans[0]), float(trans[1]), float(trans[2])),
+                center_xy=center_base_xyz[:2],
+                surface_xy=nearest_surface_base_xyz[:2],
+                base_trans=base_trans,
                 base_yaw=base_yaw,
             )
 
@@ -936,19 +1038,24 @@ class FusionLidarCameraNode:
             cmd_seq = self.cmd_seq
             caption = self.detecte_model.caption
 
-            if run_mode not in (TaskState.Follow_once, TaskState.Follow, TaskState.Recognize):
+            if run_mode not in (
+                TaskState.Follow_once,
+                TaskState.Follow,
+                TaskState.Recognize,
+                TaskState.Recognize_once,
+            ):
                 return
 
             if cmd_stamp != rospy.Time(0) and frame_stamp != rospy.Time(0) and frame_stamp < cmd_stamp:
                 return
 
-            if run_mode == TaskState.Follow and self.max_infer_fps > 0.0:
+            if run_mode in (TaskState.Follow, TaskState.Recognize) and self.max_infer_fps > 0.0:
                 min_dt = 1.0 / self.max_infer_fps
                 if self.last_infer_stamp_sec > 0.0 and (frame_stamp_sec - self.last_infer_stamp_sec) < min_dt:
                     return
                 self.last_infer_stamp_sec = frame_stamp_sec
 
-            if  run_mode == TaskState.Follow_once:
+            if run_mode in (TaskState.Follow_once, TaskState.Recognize_once):
                 self.run = TaskState.Notask
                 self.recovery.clear()
 
@@ -959,6 +1066,7 @@ class FusionLidarCameraNode:
             "frame_stamp_sec": frame_stamp_sec,
             "caption": caption,
             "cmd_seq": cmd_seq,
+            "run_mode": int(run_mode),
             "enqueue_wall_sec": now_sec,
         }
         self._enqueue_latest_job(job)

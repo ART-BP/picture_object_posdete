@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image, PointCloud2
@@ -15,12 +16,13 @@ class LidarImageTester:
     """Test node for lidar-image correspondence.
 
     Subscribes image + lidar cloud, projects lidar points to image pixels,
-    publishes debug overlay image.
+    publishes projected cloud (x,y,z,u,v) and debug overlay image.
     """
 
     def __init__(self) -> None:
         self.topic_image = rospy.get_param("~topic_image", "/camera/go2/front/image_raw")
-        self.topic_lidar = rospy.get_param("~topic_lidar", "/lidar_points")
+        self.topic_lidar = rospy.get_param("~topic_lidar", "/loc_scan_undistort")
+        self.topic_projected_cloud = rospy.get_param("~topic_projected_cloud", "/test/projected_cloud")
         self.topic_debug_image = rospy.get_param("~topic_debug_image", "/test/debug_image")
         self.camera_model = "fisheye"
 
@@ -30,6 +32,7 @@ class LidarImageTester:
         self.fisheye_balance = float(
             rospy.get_param("~fisheye_balance", 0.0)
         )
+        self.pinhole_alpha = float(rospy.get_param("~pinhole_alpha", 0.0))
 
         params = camera_handle.load_camera_params_from_yaml(camera_model=self.camera_model) 
         # For logging camera params and compatibility check
@@ -37,13 +40,23 @@ class LidarImageTester:
         self.D = np.asarray(params["D"],dtype=np.float64)
         self.distortion_model = str(params.get("distortion_model", self.camera_model))
         self.R_rect = np.asarray(params.get("R_rect", np.eye(3, dtype=np.float64)), dtype=np.float64)
+        self._undistort_map1 = None
+        self._undistort_map2 = None
+        self._undistort_K = None
+        self._undistort_cache_key = None
+        if self.topic_lidar.endswith("loc_scan_undistort"):
+            self.R = points_project.R_base_cam
+            self.T = points_project.T_base_cam
+            self.points_undisort_points = True
+        else:
+            self.R = points_project.R
+            self.T = points_project.T
+            self.points_undisort_points = False
 
-        self.R = points_project.R
-        self.T = points_project.T
-
-        self.pub_debug_image = rospy.Publisher(
-            self.topic_debug_image, Image, queue_size=1
+        self.pub_projected_cloud = rospy.Publisher(
+            self.topic_projected_cloud, PointCloud2, queue_size=1
         )
+        self.pub_debug_image = rospy.Publisher(self.topic_debug_image, Image, queue_size=1)
 
         self.sub_image = Subscriber(self.topic_image, Image)
         self.sub_lidar = Subscriber(self.topic_lidar, PointCloud2)
@@ -55,9 +68,10 @@ class LidarImageTester:
         self.sync.registerCallback(self.synced_callback)
 
         rospy.loginfo(
-            "test node ready: image=%s lidar=%s debug=%s",
+            "test node ready: image=%s lidar=%s projected=%s debug=%s",
             self.topic_image,
             self.topic_lidar,
+            self.topic_projected_cloud,
             self.topic_debug_image,
         )
         rospy.loginfo(
@@ -67,6 +81,108 @@ class LidarImageTester:
             self.K.reshape(-1).tolist(),
         )
 
+    @staticmethod
+    def _cache_array_bytes(arr: np.ndarray) -> bytes:
+        return np.ascontiguousarray(arr, dtype=np.float64).tobytes()
+
+    def _make_undistort_cache_key(self, width: int, height: int):
+        return (
+            int(width),
+            int(height),
+            str(self.distortion_model).strip().lower(),
+            float(self.fisheye_balance),
+            float(self.pinhole_alpha),
+            self._cache_array_bytes(self.K),
+            self._cache_array_bytes(self.D),
+            self._cache_array_bytes(self.R_rect),
+        )
+
+    def _ensure_undistort_maps(self, width: int, height: int) -> np.ndarray:
+        cache_key = self._make_undistort_cache_key(width, height)
+        if (
+            cache_key == self._undistort_cache_key
+            and self._undistort_map1 is not None
+            and self._undistort_map2 is not None
+            and self._undistort_K is not None
+        ):
+            return self._undistort_K
+
+        K_use = np.asarray(self.K, dtype=np.float64).reshape(3, 3)
+        D_all = np.asarray(self.D, dtype=np.float64).reshape(-1)
+        R_use = np.asarray(self.R_rect, dtype=np.float64).reshape(3, 3)
+        model = str(self.distortion_model or "").strip().lower()
+
+        if "fisheye" in model:
+            if D_all.size < 4:
+                raise ValueError(
+                    "fisheye model requires at least 4 coefficients, got %d"
+                    % int(D_all.size)
+                )
+            D_use = D_all[:4].reshape(4, 1)
+            K_new = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                K=K_use,
+                D=D_use,
+                image_size=(int(width), int(height)),
+                R=R_use,
+                balance=float(np.clip(self.fisheye_balance, 0.0, 1.0)),
+                new_size=(int(width), int(height)),
+            )
+            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                K=K_use,
+                D=D_use,
+                R=R_use,
+                P=K_new,
+                size=(int(width), int(height)),
+                m1type=cv2.CV_16SC2,
+            )
+        else:
+            D_use = camera_handle._normalize_dist_coeffs_for_pinhole(D_all)
+            K_new, _ = cv2.getOptimalNewCameraMatrix(
+                cameraMatrix=K_use,
+                distCoeffs=D_use,
+                imageSize=(int(width), int(height)),
+                alpha=float(np.clip(self.pinhole_alpha, 0.0, 1.0)),
+                newImgSize=(int(width), int(height)),
+            )
+            map1, map2 = cv2.initUndistortRectifyMap(
+                cameraMatrix=K_use,
+                distCoeffs=D_use,
+                R=R_use,
+                newCameraMatrix=K_new,
+                size=(int(width), int(height)),
+                m1type=cv2.CV_16SC2,
+            )
+
+        self._undistort_map1 = map1
+        self._undistort_map2 = map2
+        self._undistort_K = K_new.astype(np.float64, copy=False)
+        self._undistort_cache_key = cache_key
+        rospy.loginfo(
+            "undistort map cached: size=%dx%d model=%s",
+            int(width),
+            int(height),
+            self.distortion_model,
+        )
+        return self._undistort_K
+
+    def _undistort_image_cached(self, image: np.ndarray):
+        if image is None:
+            raise ValueError("image is None")
+        if image.ndim not in (2, 3):
+            raise ValueError("image must be HxW or HxWxC, got ndim=%d" % int(image.ndim))
+
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if height <= 0 or width <= 0:
+            raise ValueError("invalid image shape: %s" % (str(image.shape),))
+
+        K_undist = self._ensure_undistort_maps(width, height)
+        image_undist = cv2.remap(
+            image,
+            self._undistort_map1,
+            self._undistort_map2,
+            cv2.INTER_LINEAR,
+        )
+        return image_undist, K_undist
 
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
 
@@ -77,15 +193,7 @@ class LidarImageTester:
             return
 
         try:
-            image_undist, K_undist = camera_handle.undistort_image(
-                image=image_bgr,
-                K_camera=self.K,
-                dist_coeffs=self.D,
-                distortion_model=self.distortion_model,
-                R_rect=self.R_rect,
-                P=None,
-                fisheye_balance=self.fisheye_balance,
-            )
+            image_undist, K_undist = self._undistort_image_cached(image_bgr)
         except Exception as exc:
             rospy.logwarn_throttle(2.0, "image undistort failed: %s", str(exc))
             return
@@ -109,7 +217,7 @@ class LidarImageTester:
             width=w,
             height=h,
             dist_coeffs=self.D,
-            min_depth=self.min_depth,
+            undisort_points=self.points_undisort_points,
         )
         if xyz_proj.shape[0] == 0:
             rospy.logwarn_throttle(
@@ -117,6 +225,13 @@ class LidarImageTester:
                 "no projected points inside image (camera_model=%s)",
                 self.camera_model,
             )
+            return
+
+        try:
+            projected_cloud = cloudpoints_handle._build_cloud_xyzuv(cloud_msg.header, xyz_proj, uv)
+            self.pub_projected_cloud.publish(projected_cloud)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "build/publish projected cloud failed: %s", str(exc))
             return
 
         overlay = points_project.draw_overlay(image_undist, uv, depth)

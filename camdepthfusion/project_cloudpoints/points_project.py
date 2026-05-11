@@ -27,7 +27,7 @@ AXIS_REMAP = np.array(
     dtype=np.float64,
 ).reshape(3, 3)
 
-
+### 从原始点云到相机坐标系的变换，基于标定结果，保持与undistortion_project.py一致
 R = np.array([
     [-0.999972,  0.004859,  0.005607],
     [-0.005586,  0.004351, -0.999975],
@@ -52,6 +52,15 @@ T = np.array([0.012069, -0.097637, -0.175698], dtype=np.float64)
 
 # T = np.array([0.017952, -0.097494, -0.175946], dtype=np.float64)
 
+##  base_link to camera坐标变换
+R_base_cam = np.array([
+    [-0.005248,  -0.999970,  0.005643],
+    [-0.004324, -0.005621, -0.999975],
+    [0.999977, -0.005272, -0.004294]
+], dtype=np.float64)
+
+T_base_cam = np.array([0.013454, -0.006172, -0.346313], dtype=np.float64)
+
 def project_lidar_to_image(
     xyz_lidar: np.ndarray,
     R_optical_lidar: np.ndarray,
@@ -60,7 +69,7 @@ def project_lidar_to_image(
     width: int,
     height: int,
     dist_coeffs: np.ndarray,
-    min_depth: float,
+    undisort_points: bool = False,
 ):
     """Map lidar points to image pixels on undistorted image."""
     if xyz_lidar.size == 0:
@@ -70,7 +79,10 @@ def project_lidar_to_image(
             np.zeros((0,), dtype=np.float32),
         )
 
-    mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    if undisort_points:
+        mask = (xyz_lidar[:, 0] > 0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    else:
+        mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
     if not np.any(mask):
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -79,18 +91,7 @@ def project_lidar_to_image(
         )
     xyz_lidar_valid = xyz_lidar[mask]
     xyz_cam = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
-    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    # if not np.any(valid):
-    #     return (
-    #         np.zeros((0, 3), dtype=np.float32),
-    #         np.zeros((0, 2), dtype=np.float32),
-    #         np.zeros((0,), dtype=np.float32),
-    #     )
 
-    # xyz_lidar_valid = xyz_lidar[valid]
-    # xyz_cam = xyz_cam[valid]
-
-    # Keep D for compatibility; projection assumes undistorted image.
     _ = dist_coeffs
     uvw = (K_camera @ xyz_cam.T).T
     uv = uvw[:, :2] / uvw[:, 2:3]
@@ -122,7 +123,7 @@ def project_lidar_to_image_with_distortion(
     dist_coeffs: np.ndarray,
     width: int,
     height: int,
-    min_depth: float,
+    undisort_points: bool = False,
 ):
     """Map lidar points to image pixels using distortion coefficients.
 
@@ -135,18 +136,13 @@ def project_lidar_to_image_with_distortion(
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-    xyz_lidar_valid = xyz_lidar[xyz_lidar[:, 1] < -0.2]
+    if undisort_points:
+        mask = (xyz_lidar[:, 0] > 0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    else:
+        mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    xyz_lidar_valid = xyz_lidar[mask]
     xyz_cam = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
-    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    # if not np.any(valid):
-    #     return (
-    #         np.zeros((0, 3), dtype=np.float32),
-    #         np.zeros((0, 2), dtype=np.float32),
-    #         np.zeros((0,), dtype=np.float32),
-    #     )
 
-    # xyz_lidar_valid = xyz_lidar[valid]
-    # xyz_cam = xyz_cam[valid].astype(np.float64, copy=False)
     K_use = np.asarray(K_camera, dtype=np.float64).reshape(3, 3)
     D_use = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
 
@@ -188,7 +184,7 @@ def project_lidar_to_image_with_rational_polynomial(
     dist_coeffs: np.ndarray,
     width: int,
     height: int,
-    min_depth: float,
+    undisort_points: bool = False,
 ):
     """Map lidar points to raw image pixels using rational_polynomial distortion.
 
@@ -225,7 +221,7 @@ def project_lidar_to_image_with_rational_polynomial(
         dist_coeffs=D_use,
         width=width,
         height=height,
-        min_depth=min_depth,
+        undisort_points=undisort_points,
     )
 
 
@@ -237,7 +233,7 @@ def project_lidar_to_image_with_fisheye_distortion(
     dist_coeffs: np.ndarray,
     width: int,
     height: int,
-    min_depth: float,
+    undisort_points: bool = False,
     theta_margin_deg: float = 1.0,
 ):
     """Map lidar points to image pixels using the OpenCV fisheye model.
@@ -251,7 +247,10 @@ def project_lidar_to_image_with_fisheye_distortion(
             np.zeros((0, 2), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-    mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    if undisort_points:
+        mask = (xyz_lidar[:, 0] > 0.3) & (xyz_lidar[:, 2] > float(-0.4))
+    else:
+        mask = (xyz_lidar[:, 1] < -0.3) & (xyz_lidar[:, 2] > float(-0.4))
     if not np.any(mask):
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -259,17 +258,7 @@ def project_lidar_to_image_with_fisheye_distortion(
             np.zeros((0,), dtype=np.float32),
         )
     xyz_lidar_valid = xyz_lidar[mask]
-    # xyz_cam = (R_optical_lidar @ xyz_lidar.T).T + t_optical_lidar.reshape(1, 3)
     xyz_cam_valid = (R_optical_lidar @ xyz_lidar_valid.T).T + t_optical_lidar.reshape(1, 3)
-    # valid = np.isfinite(xyz_cam).all(axis=1) & (xyz_cam[:, 2] > float(min_depth))
-    # if not np.any(valid):
-    #     return (
-    #         np.zeros((0, 3), dtype=np.float32),
-    #         np.zeros((0, 2), dtype=np.float32),
-    #         np.zeros((0,), dtype=np.float32),
-    #     )
-    # xyz_lidar_valid = xyz_lidar[valid]
-    # xyz_cam_valid = xyz_cam[valid].astype(np.float64, copy=False)
 
     theta_limit = _estimate_fisheye_theta_limit(
         K_camera=K_camera,

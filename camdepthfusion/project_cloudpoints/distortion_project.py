@@ -20,7 +20,8 @@ class LidarImageTester:
 
     def __init__(self) -> None:
         self.topic_image = rospy.get_param("~topic_image", "/camera/go2/front/image_raw")
-        self.topic_lidar = rospy.get_param("~topic_lidar", "/lidar_points")
+        self.topic_lidar = rospy.get_param("~topic_lidar", "/loc_scan_undistort")
+        self.undistort_points = True if self.topic_lidar.endswith("undistort") else False
         self.topic_projected_cloud = rospy.get_param("~topic_projected_cloud", "/test/projected_cloud")
         self.topic_debug_image = rospy.get_param("~topic_debug_image", "/test/debug_image")
 
@@ -39,9 +40,12 @@ class LidarImageTester:
         self.D = np.asarray(params["D"],dtype=np.float64)
 
         self.axis_remap = points_project.AXIS_REMAP
-
-        self.R = points_project.R
-        self.T = points_project.T
+        if self.undistort_points:
+            self.R = points_project.R_base_cam
+            self.T = points_project.T_base_cam
+        else:
+            self.R = points_project.R
+            self.T = points_project.T
 
         self.pub_projected_cloud = rospy.Publisher(
             self.topic_projected_cloud, PointCloud2, queue_size=1
@@ -113,7 +117,7 @@ class LidarImageTester:
             width=w,
             height=h,
             dist_coeffs=self.D,
-            min_depth=self.min_depth,
+            undisort_points=self.undistort_points,
         )
         if xyz_proj.shape[0] == 0:
             rospy.logwarn_throttle(2.0, "no projected points inside image")
