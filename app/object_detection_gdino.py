@@ -18,7 +18,6 @@ from std_msgs.msg import String
 
 from GroundingDINO.gdino import GroundingDINO
 from MobileSAM.sam import Sam
-from yoloe.yoloe import Yoloe
 
 import actionlib
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
@@ -29,7 +28,6 @@ from tf.transformations import quaternion_from_euler
 from camdepthfusion.project_cloudpoints import points_project
 from camdepthfusion.project_cloudpoints import cloudpoints_handle
 from camdepthfusion.camera_op import camera_handle
-from app.recovery import RecoveryAction, RecoveryController
 from app.params_load import _load_runtime_config, _cfg_get
 
 class TaskState(IntEnum):
@@ -92,13 +90,6 @@ class FusionLidarCameraNode:
         self.debug_max_points = _cfg_get(cfg, "debug_max_points", 500, int)
         self.save_debug_images = _cfg_get(cfg, "save_debug_images", False, bool)
         self.output_dir = _cfg_get(cfg, "output_dir", default_output_dir, str)
-        self.recovery_move_after_s = _cfg_get(cfg, "recovery_move_after_s", 5.0, float)
-        self.recovery_rotate_after_s = _cfg_get(cfg, "recovery_rotate_after_s", 10.0, float)
-        self.recovery_cancel_after_s = _cfg_get(cfg, "recovery_cancel_after_s", 30.0, float)
-        self.recovery_rotate_interval_s = _cfg_get(cfg, "recovery_rotate_interval_s", 2.0, float)
-        self.recovery_forward_dist_m = _cfg_get(cfg, "recovery_forward_dist_m", 2.0, float)
-        self.recovery_rotate_deg = _cfg_get(cfg, "recovery_rotate_deg", 90.0, float)
-        self.recovery_tick_hz = _cfg_get(cfg, "recovery_tick_hz", 10.0, float)
         
         self.run = TaskState.Notask
         self.cmd_stamp = rospy.Time(0)
@@ -108,25 +99,12 @@ class FusionLidarCameraNode:
         self.low_identity_streak = 0
         self.reacquire_counter = 0
         self.state_lock = threading.Lock()
-        self.recovery = RecoveryController(
-            move_after_sec=self.recovery_move_after_s,
-            rotate_after_sec=self.recovery_rotate_after_s,
-            cancel_after_sec=self.recovery_cancel_after_s,
-            rotate_interval_sec=self.recovery_rotate_interval_s,
-        )
 
 
-        select = _cfg_get(cfg, "model", "gdino", str).strip().lower()
-        select = rospy.get_param("~model", select)
-        if select == "gdino":
-            self.detecte_model = GroundingDINO()
-            self.detecte_model.setparameters(caption=caption, box_threshold=box_threshold, 
-                                        text_threshold=text_threshold,
-                                        return_labels=self.enable_debug_overlay)
-        else:
-            model = select[-3:]
-            self.detecte_model = Yoloe(model)
-            self.detecte_model.setparameters(caption=caption, threshold=box_threshold)
+        self.detecte_model = GroundingDINO()
+        self.detecte_model.setparameters(caption=caption, box_threshold=box_threshold, 
+                                    text_threshold=text_threshold,
+                                    return_labels=self.enable_debug_overlay)
         
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.image_target = cv2.imread(os.path.join(repo_root, "bag", "test0_crop.png"))
@@ -143,12 +121,6 @@ class FusionLidarCameraNode:
         self.stop_event = threading.Event()
         self.worker_lock = threading.Lock()
         self.worker_thread: Optional[threading.Thread] = None
-        self.recovery_thread = threading.Thread(
-            target=self._recovery_loop,
-            name="fusion_recovery",
-            daemon=True,
-        )
-        self.recovery_thread.start()
 
         self.pub_debug_image = rospy.Publisher("/fusion_lidar_camera/image", Image, queue_size=1, latch=True)
         self.pub_object_points = rospy.Publisher("/fusion_lidar_camera/object_points", PointCloud2, queue_size=1)
@@ -176,7 +148,8 @@ class FusionLidarCameraNode:
             rospy.logerr("Failed to connect to move_base action server: %s", str(e))
 
         #  订阅跟踪命令
-        self.sub_cmd = rospy.Subscriber("object_cmd", String, self.cmd_callback, queue_size=10)
+        self.command_topic = "/task/stream"
+        self.sub_cmd = rospy.Subscriber(self.command_topic, String, self.cmd_callback, queue_size=10)
         rospy.on_shutdown(self._on_shutdown)
 
         if self.save_debug_images:
@@ -202,17 +175,16 @@ class FusionLidarCameraNode:
         try:
             tmsg = json.loads(msg.data)
         except Exception as exc:
-            rospy.logwarn("Invalid object_cmd JSON: %s, raw=%s", str(exc), msg.data)
+            rospy.logwarn("Invalid %s JSON: %s, raw=%s", self.command_topic, str(exc), msg.data)
             return
 
         now = rospy.Time.now()
         now_sec = now.to_sec()
         task = str(tmsg.get("task", "none")).lower()
 
-        # Any new command starts a fresh recovery context.
-        self.recovery.clear()
         with self.state_lock:
-            caption = tmsg.get("caption", self.detecte_model.caption)
+            params = tmsg.get("params", self.detecte_model.caption)
+            caption = self._params_to_caption(params)
             self.cmd_seq += 1
 
             self.detecte_model.setparameters(caption=caption)
@@ -238,8 +210,6 @@ class FusionLidarCameraNode:
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
 
-        self.recovery.on_task(task=task, now_sec=now_sec)
-
         if task in ("follow", "recognition", "recognition_once", "follow_once"):
             self._ensure_worker_started()
 
@@ -249,12 +219,23 @@ class FusionLidarCameraNode:
 
         self.last_time = now_sec
         rospy.loginfo(
-            "Received cmd: caption=%s task=%s  cmd_stamp=%.6f cmd_seq=%d",
-            caption,
+            "Received cmd: params=%s task=%s  cmd_stamp=%.6f cmd_seq=%d",
+            params,
             task,
             self._as_float_seconds(cmd_stamp),
             cmd_seq,
         )
+
+    @staticmethod
+    def _params_to_caption(params) -> str:
+        """Convert task params into the GDINO text prompt."""
+        if params is None:
+            return ""
+        if isinstance(params, str):
+            return params
+        if isinstance(params, (list, tuple)):
+            return ", ".join(str(item) for item in params)
+        return str(params)
 
     def _ensure_worker_started(self) -> None:
         """Start worker lazily after receiving a valid task command."""
@@ -270,101 +251,10 @@ class FusionLidarCameraNode:
             )
             self.worker_thread.start()
 
-    def _recovery_loop(self) -> None:
-        tick_hz = max(1.0, float(self.recovery_tick_hz))
-        sleep_dt = 1.0 / tick_hz  
-              
-        if self.run == TaskState.Notask:
-            self.stop_event.wait(sleep_dt)  
-
-        while not rospy.is_shutdown() and not self.stop_event.is_set():
-            event = self.recovery.poll(now_sec=rospy.Time.now().to_sec())
-            if event is not None:
-                self._handle_recovery_event(event)
-            self.stop_event.wait(sleep_dt)
-
-    def _lookup_base_pose(self) -> Optional[Tuple[Tuple[float, float, float], float]]:
-        try:
-            self.tf_listener.waitForTransform(
-                self.goal_frame,
-                self.base_frame,
-                rospy.Time(0),
-                rospy.Duration(self.tf_timeout_s),
-            )
-            trans, rot = self.tf_listener.lookupTransform(
-                self.goal_frame,
-                self.base_frame,
-                rospy.Time(0),
-            )
-            base_yaw = float(tf.transformations.euler_from_quaternion(rot)[2])
-            return (float(trans[0]), float(trans[1]), float(trans[2])), base_yaw
-        except Exception as exc:
-            rospy.logwarn_throttle(1.0, "recovery TF lookup failed: %s", str(exc))
-            return None
-
-    def _send_recovery_forward_goal(self, heading_rad: float) -> None:
-        pose = self._lookup_base_pose()
-        if pose is None:
-            return
-        base_trans, base_yaw = pose
-        yaw_map = base_yaw + float(heading_rad)
-        goal_x = float(base_trans[0] + self.recovery_forward_dist_m * math.cos(yaw_map))
-        goal_y = float(base_trans[1] + self.recovery_forward_dist_m * math.sin(yaw_map))
-        q = quaternion_from_euler(0.0, 0.0, yaw_map)
-
-        goal = MoveBaseGoal()
-        goal.target_pose.header.stamp = rospy.Time.now()
-        goal.target_pose.header.frame_id = self.goal_frame
-        goal.target_pose.pose.position.x = goal_x
-        goal.target_pose.pose.position.y = goal_y
-        goal.target_pose.pose.position.z = 0.0
-        goal.target_pose.pose.orientation = Quaternion(*q)
-        self.client.send_goal(goal)
-
-    def _send_recovery_rotate_goal(self, heading_rad: float) -> None:
-        pose = self._lookup_base_pose()
-        if pose is None:
-            return
-        base_trans, base_yaw = pose
-        turn_sign = 1.0 if float(heading_rad) >= 0.0 else -1.0
-        yaw_map = base_yaw + turn_sign * math.radians(float(self.recovery_rotate_deg))
-        q = quaternion_from_euler(0.0, 0.0, yaw_map)
-
-        goal = MoveBaseGoal()
-        goal.target_pose.header.stamp = rospy.Time.now()
-        goal.target_pose.header.frame_id = self.goal_frame
-        goal.target_pose.pose.position.x = float(base_trans[0])
-        goal.target_pose.pose.position.y = float(base_trans[1])
-        goal.target_pose.pose.position.z = 0.0
-        goal.target_pose.pose.orientation = Quaternion(*q)
-        self.client.send_goal(goal)
-
-    def _handle_recovery_event(self, event) -> None:
-        if event.action == RecoveryAction.MOVE_LAST_DIRECTION:
-            self._send_recovery_forward_goal(event.heading_rad)
-            rospy.logwarn("recovery move triggered: lost=%.2fs", event.lost_sec)
-            return
-
-        if event.action == RecoveryAction.ROTATE_IN_PLACE:
-            self._send_recovery_rotate_goal(event.heading_rad)
-            rospy.logwarn("recovery rotate triggered: lost=%.2fs", event.lost_sec)
-            return
-
-        if event.action == RecoveryAction.CANCEL_TASK:
-            with self.state_lock:
-                self.run = TaskState.Notask
-                self.cmd_stamp = rospy.Time(0)
-                self.cmd_seq += 1
-            self.client.cancel_goal()
-            self._clear_pending_jobs()
-            rospy.logwarn("recovery cancel triggered: lost=%.2fs", event.lost_sec)
-
     def _on_shutdown(self) -> None:
         """Stop worker thread quickly during node shutdown."""
         self.stop_event.set()
         self._clear_pending_jobs()
-        if self.recovery_thread.is_alive():
-            self.recovery_thread.join(timeout=0.5)
         worker = self.worker_thread
         if worker is not None and worker.is_alive():
             try:
@@ -421,10 +311,7 @@ class FusionLidarCameraNode:
             return
 
         surface_dist = float(np.linalg.norm(surface))
-        center_dist = float(np.linalg.norm(center))
-        if surface_dist <= self.min_goal_dist_m or center_dist <= self.min_goal_dist_m:
-            rospy.loginfo("object distance too close")
-            return       
+        center_dist = float(np.linalg.norm(center))     
 
         if surface_dist > center_dist:
             rospy.logwarn("surface_dist > center_dist")
@@ -441,8 +328,10 @@ class FusionLidarCameraNode:
         goal_map_x = float(base_trans[0] + cos_yaw * goal_x - sin_yaw * goal_y)
         goal_map_y = float(base_trans[1] + sin_yaw * goal_x + cos_yaw * goal_y)
         yaw_map = base_yaw + yaw_center
+        if surface_dist <= self.min_goal_dist_m or center_dist <= self.min_goal_dist_m:
+            rospy.loginfo("object distance too close")
+            return  
 
-        self.recovery.on_detection(goal_map_x, goal_map_y, rospy.Time.now().to_sec())
         q = quaternion_from_euler(0.0, 0.0, yaw_map)
 
         goal = MoveBaseGoal()
@@ -857,7 +746,6 @@ class FusionLidarCameraNode:
                 base_yaw=base_yaw,
             )
 
-    
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""
         lidar_sec = self._as_float_seconds(cloud_msg.header.stamp)
@@ -902,7 +790,6 @@ class FusionLidarCameraNode:
 
             if run_mode in (TaskState.Follow_once, TaskState.Recognize_once):
                 self.run = TaskState.Notask
-                self.recovery.clear()
 
         job = {
             "image_msg": image_msg,

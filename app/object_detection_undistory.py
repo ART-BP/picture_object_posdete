@@ -30,7 +30,6 @@ from camdepthfusion.project_cloudpoints import points_project
 from camdepthfusion.project_cloudpoints import cloudpoints_handle
 from camdepthfusion.camera_op import camera_handle
 from app.recovery import RecoveryAction, RecoveryController
-from accelerated_features.modules.xfeat import XFeat
 from app.params_load import _load_runtime_config, _cfg_get
 
 class TaskState(IntEnum):
@@ -146,8 +145,6 @@ class FusionLidarCameraNode:
             )
         self.template_hs_hist = self._compute_hs_hist(self.image_target)
         self.sam_model = Sam()
-
-        self.xfeat = XFeat()
 
         self.tf_listener = tf.TransformListener()
         self.job_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
@@ -975,159 +972,7 @@ class FusionLidarCameraNode:
                 base_trans=base_trans,
                 base_yaw=base_yaw,
             )
-
-    def match_features(self, image, detections, conf):
-        if image is None:
-            return 0
-
-        n_det = len(detections.xyxy)
-        if n_det <= 0:
-            return 0
-
-        conf_arr = np.asarray(conf, dtype=np.float32).reshape(-1)
-        if conf_arr.shape[0] != n_det:
-            conf_arr = np.zeros((n_det,), dtype=np.float32)
-
-        # Stage-1 fast gating: confidence only.
-        fast_scores = conf_arr.copy()
-
-        # Periodic/global re-acquire to recover from wrong lock.
-        self.reacquire_counter += 1
-        force_global = (
-            self.low_identity_streak >= 2
-            or (self.reacquire_counter % 5 == 0)
-        )
-        if n_det <= 4 or force_global:
-            candidate_idxs = list(range(n_det))
-        else:
-            top_k = min(4, n_det)
-            candidate_idxs = np.argsort(-fast_scores)[:top_k].tolist()
-
-        if len(candidate_idxs) == 0:
-            return int(np.argmax(conf_arr)) if conf_arr.shape[0] > 0 else 0
-
-        # No identity template: fallback to fast gate only.
-        if self.image_target is None:
-            return int(candidate_idxs[0])
-
-        # Stage-2 identity scoring: XFeat + geometric inlier ratio.
-        h, w = image.shape[:2]
-        final_scores = {}
-        ransac_method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
-        for i in candidate_idxs:
-            box = detections.xyxy[i]
-            x1, y1, x2, y2 = [int(round(float(v))) for v in box]
-            x1 = max(0, min(w - 1, x1))
-            y1 = max(0, min(h - 1, y1))
-            x2 = max(0, min(w - 1, x2))
-            y2 = max(0, min(h - 1, y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            crop = image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            try:
-                mkpts_0, mkpts_1 = self.xfeat.match_xfeat(self.image_target, crop)
-                id_score = 0.0
-                n_match = int(mkpts_0.shape[0]) if mkpts_0 is not None else 0
-                inliers = 0
-                if (
-                    mkpts_0 is not None
-                    and mkpts_1 is not None
-                    and mkpts_0.shape[0] >= 4
-                    and mkpts_1.shape[0] >= 4
-                ):
-                    _, inlier_mask = cv2.findHomography(
-                        mkpts_0.astype(np.float32),
-                        mkpts_1.astype(np.float32),
-                        ransac_method,
-                        3.0,
-                    )
-                    if inlier_mask is not None:
-                        inliers = int(inlier_mask.reshape(-1).sum())
-                        inlier_ratio = float(inliers) / float(max(n_match, 1))
-                        support = min(1.0, float(n_match) / 30.0)
-                        id_score = inlier_ratio * support
-            except Exception as exc:
-                rospy.logwarn_throttle(1.0, "XFeat match failed on det[%d]: %s", i, str(exc))
-                id_score = 0.0
-                n_match = 0
-                inliers = 0
-
-            hist_score = 0.0
-            if self.template_hs_hist is not None:
-                crop_hist = self._compute_hs_hist(crop)
-                if crop_hist is not None:
-                    corr = float(cv2.compareHist(self.template_hs_hist, crop_hist, cv2.HISTCMP_CORREL))
-                    hist_score = max(0.0, min(1.0, 0.5 * (corr + 1.0)))
-
-            final_score = (
-                0.70 * id_score
-                + 0.20 * hist_score
-                + 0.10 * float(conf_arr[i])
-            )
-            final_scores[i] = {
-                "final": float(final_score),
-                "id": float(id_score),
-                "hist": float(hist_score),
-                "conf": float(conf_arr[i]),
-                "matches": int(n_match),
-                "inliers": int(inliers),
-            }
-            rospy.loginfo(
-                "det[%d] score: final=%.4f conf=%.4f id=%.4f hist=%.4f m=%d inl=%d",
-                i,
-                final_scores[i]["final"],
-                final_scores[i]["conf"],
-                final_scores[i]["id"],
-                final_scores[i]["hist"],
-                final_scores[i]["matches"],
-                final_scores[i]["inliers"],
-            )
-
-        if len(final_scores) == 0:
-            return int(candidate_idxs[0])
-
-        ranked = sorted(final_scores.items(), key=lambda kv: kv[1]["final"], reverse=True)
-        best_idx = int(ranked[0][0])
-
-        # Force switch to the strongest identity candidate when evidence is clear.
-        if len(final_scores) >= 2:
-            top_final_idx = int(ranked[0][0])
-            best_id_idx = max(final_scores.keys(), key=lambda k: final_scores[k]["id"])
-            top_final_id = float(final_scores[top_final_idx]["id"])
-            best_id = float(final_scores[best_id_idx]["id"])
-            best_hist = float(final_scores[best_id_idx]["hist"])
-            if (
-                best_id_idx != top_final_idx
-                and best_id >= 0.18
-                and best_hist >= 0.25
-                and (best_id - top_final_id) >= 0.05
-            ):
-                best_idx = int(best_id_idx)
-                rospy.loginfo(
-                    "identity override: top_final_idx=%d top_final_id=%.3f -> best_id_idx=%d best_id=%.3f best_hist=%.3f",
-                    top_final_idx,
-                    top_final_id,
-                    int(best_id_idx),
-                    best_id,
-                    best_hist,
-                )
-
-        # Global re-acquire trigger when identity evidence stays weak for several frames.
-        chosen_id = final_scores.get(best_idx, {}).get("id", 0.0)
-        chosen_hist = final_scores.get(best_idx, {}).get("hist", 0.0)
-        if chosen_id < 0.06 and chosen_hist < 0.25:
-            self.low_identity_streak += 1
-        else:
-            self.low_identity_streak = 0
-        if self.low_identity_streak >= 4:
-            self.low_identity_streak = 0
-            rospy.logwarn("identity weak for several frames, trigger global reacquire")
-
-        return best_idx
+ 
     
     def synced_callback(self, image_msg: Image, cloud_msg: PointCloud2) -> None:
         """Gate and enqueue synced frames; heavy compute runs only in worker thread."""

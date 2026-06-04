@@ -1,0 +1,47 @@
+## 输出话题
+
+| Topic | Type | 说明 |
+|---|---|---|
+| `/fusion_lidar_camera/object_depth_json` | `std_msgs/String` | 目标几何结果 JSON |
+| `/fusion_lidar_camera/image` | `sensor_msgs/Image` | 调试图像 |
+| `/fusion_lidar_camera/object_points` | `sensor_msgs/PointCloud2` | 目标点云 |
+
+## 输出 JSON
+
+`/fusion_lidar_camera/object_depth_json` 的 payload 是 JSON 字符串。
+
+字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stamp` | float | 图像时间戳，单位秒 |
+| `frame_id` | string | 输入点云坐标系 |
+| `base_frame` | string | 底盘坐标系 |
+| `global_frame` | string | 全局坐标系 |
+| `caption` | string | 当前目标描述 |
+| `bbox_xyxy` | list[float] | 检测框 `[x1, y1, x2, y2]` |
+| `gdino_score` | float | 检测置信度 |
+| `num_points` | int | 目标点云数量 |
+| `centroid_xyz_m` | list[float] | 目标中心点，全局坐标系，单位米 |
+| `nearest_surface_xyz_m` | list[float] | 最近表面点，全局坐标系，单位米 |
+| `nearest_surface_dist_m` | float | 最近表面点到机器人距离，单位米 |
+
+示例：
+
+```json
+{
+  "stamp": 1713412345.12,
+  "frame_id": "lidar",
+  "base_frame": "base_link",
+  "global_frame": "map",
+  "caption": "black box",
+  "bbox_xyxy": [312.2, 118.7, 557.4, 420.6],
+  "gdino_score": 0.89,
+  "num_points": 146,
+  "centroid_xyz_m": [2.31, -0.46, 0.12],
+  "nearest_surface_xyz_m": [1.88, -0.39, 0.08],
+  "nearest_surface_dist_m": 1.92
+}
+```
+
+当点数不足、TF 失败或几何结果无效时，不发布该 JSON。

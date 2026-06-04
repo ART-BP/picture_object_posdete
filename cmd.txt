@@ -1,12 +1,32 @@
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"white wall\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"white column\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"person\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"recognition\",\"caption\":\"person in green\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"black box\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"The person wearing yellow clothes\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"follow\",\"caption\":\"person in green\"}'"
-rostopic pub -1 /object_cmd std_msgs/String "data: '{\"task\":\"cancel\",\"caption\":\"black box\"}'"
+# 搜索开始：进入 follow，目标为“伤员”
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"搜索\",\"params\":[\"开始\",\"伤员\"]}'"
+
+# 搜索暂停：取消当前任务
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"搜索\",\"params\":[\"暂停\",\"\"]}'"
+
+# 搜索继续：进入 follow，目标为“伤员”
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"搜索\",\"params\":[\"继续\",\"伤员\"]}'"
+
+# 基础动作取消任务
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"基础动作\",\"params\":\"取消任务\"}'"
+
+# 持续跟随
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"follow\",\"params\":[\"伤员\"]}'"
+
+# 持续识别并发布结果
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"recognition\",\"params\":[\"person\"]}'"
+
+# 单次识别
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"recognition_once\",\"params\":[\"伤员\"]}'"
+
+# 单次跟随/前往
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"follow_once\",\"params\":[\"伤员\"]}'"
+
+# 取消任务
+rostopic pub -1 /task/stream std_msgs/String "data: '{\"task\":\"cancel\",\"params\":[]}'"
 Channel Entrance
 Electronic screen
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 4 python -m app.objectnav
 
+[ERROR] [1778739223.981491]: Got a transition callback on a goal handle that we're not tracking
+[ERROR] [1778808083.066643]: Received comm state PREEMPTING when in simple state DONE with SimpleActionClient in NS /move_base
