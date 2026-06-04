@@ -178,34 +178,44 @@ class FusionLidarCameraNode:
             rospy.logwarn("Invalid %s JSON: %s, raw=%s", self.command_topic, str(exc), msg.data)
             return
 
+        parsed = self._parse_task_stream_command(tmsg)
+        if parsed is None:
+            rospy.loginfo_throttle(
+                1.0,
+                "skip unsupported %s command: %s",
+                self.command_topic,
+                msg.data,
+            )
+            return
+
+        task, caption, params = parsed
         now = rospy.Time.now()
         now_sec = now.to_sec()
-        task = str(tmsg.get("task", "none")).lower()
 
         with self.state_lock:
-            params = tmsg.get("params", self.detecte_model.caption)
-            caption = self._params_to_caption(params)
             self.cmd_seq += 1
 
-            self.detecte_model.setparameters(caption=caption)
             if task == "follow":
+                self.detecte_model.setparameters(caption=caption)
                 self.run = TaskState.Follow
                 self.cmd_stamp = now
             elif task == "recognition":
+                self.detecte_model.setparameters(caption=caption)
                 self.run = TaskState.Recognize
                 self.cmd_stamp = now
             elif task == "recognition_once":
+                self.detecte_model.setparameters(caption=caption)
                 self.run = TaskState.Recognize_once
                 self.cmd_stamp = now
             elif task == "follow_once":
+                self.detecte_model.setparameters(caption=caption)
                 self.run = TaskState.Follow_once
                 self.cmd_stamp = now
             elif task == "cancel":
                 self.run = TaskState.Notask
                 self.cmd_stamp = rospy.Time(0)
             else:
-                self.run = TaskState.Notask
-                self.cmd_stamp = rospy.Time(0)
+                return
 
             cmd_stamp = self.cmd_stamp
             cmd_seq = self.cmd_seq
@@ -226,11 +236,46 @@ class FusionLidarCameraNode:
             cmd_seq,
         )
 
+    def _parse_task_stream_command(self, tmsg: dict) -> Optional[Tuple[str, str, object]]:
+        """Accept only the supported /task/stream command shapes."""
+        raw_task = str(tmsg.get("task", "")).strip()
+        params = tmsg.get("params", None)
+        task_lower = raw_task.lower()
+
+        # Compatible with the follow command protocol used by object_detection_gdino.py.
+        if task_lower in ("follow", "recognition", "recognition_once", "follow_once", "cancel"):
+            caption = self._params_to_caption(params, self.detecte_model.caption)
+            return task_lower, caption, params
+
+        if raw_task == "搜索" and isinstance(params, (list, tuple)) and len(params) >= 2:
+            action = str(params[0]).strip()
+            caption = "person"
+
+            # {"task": "搜索", "params": ["开始", "伤员"], ...}
+            if action == "开始" and caption:
+                return "recognition", caption, params
+
+            # {"task": "搜索", "params": ["暂停", ""], ...}
+            if action == "暂停" and caption == "":
+                return "cancel", "", params
+
+            # {"task": "搜索", "params": ["继续", "伤员"], ...}
+            if action == "继续" and caption:
+                return "recognition", caption, params
+
+            return None
+
+        # {"task": "基础动作", "params": "取消任务", ...}
+        if raw_task == "基础动作" and str(params).strip() == "取消任务":
+            return "cancel", "", params
+
+        return None
+
     @staticmethod
-    def _params_to_caption(params) -> str:
+    def _params_to_caption(params, default: str = "") -> str:
         """Convert task params into the GDINO text prompt."""
         if params is None:
-            return ""
+            return str(default)
         if isinstance(params, str):
             return params
         if isinstance(params, (list, tuple)):
