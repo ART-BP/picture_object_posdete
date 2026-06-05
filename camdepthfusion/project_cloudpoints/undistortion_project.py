@@ -21,10 +21,10 @@ class LidarImageTester:
 
     def __init__(self) -> None:
         self.topic_image = rospy.get_param("~topic_image", "/camera/go2/front/image_raw")
-        self.topic_lidar = rospy.get_param("~topic_lidar", "/loc_scan_undistort")
+        self.topic_lidar = rospy.get_param("~topic_lidar", "/lidar_points")
         self.topic_projected_cloud = rospy.get_param("~topic_projected_cloud", "/test/projected_cloud")
         self.topic_debug_image = rospy.get_param("~topic_debug_image", "/test/debug_image")
-        self.camera_model = "fisheye"
+        self.camera_model = "fenduifisheye"
 
         self.sync_queue_size = int(rospy.get_param("~sync_queue_size", 3))
         self.sync_slop = float(rospy.get_param("~sync_slop", 0.05))
@@ -49,8 +49,8 @@ class LidarImageTester:
             self.T = points_project.T_base_cam
             self.points_undisort_points = True
         else:
-            self.R = points_project.R
-            self.T = points_project.T
+            self.R = points_project.R_fendui
+            self.T = points_project.T_fendui
             self.points_undisort_points = False
 
         self.pub_projected_cloud = rospy.Publisher(

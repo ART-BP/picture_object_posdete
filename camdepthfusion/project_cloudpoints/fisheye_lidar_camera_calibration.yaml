@@ -1,0 +1,92 @@
+# Fisheye camera and LiDAR calibration
+#
+# Projection model:
+#   P_camera = R_lidar_to_camera * P_lidar + t_lidar_to_camera
+#
+# Coordinate convention:
+#   P_lidar  = [x_lidar, y_lidar, z_lidar]^T
+#   P_camera = [x_camera, y_camera, z_camera]^T
+#   Translation unit: meter
+#   Rotation order: row-major
+#   Fisheye distortion order: [k1, k2, k3, k4]
+
+camera:
+  model: fisheye
+
+  intrinsics:
+    fx: 1130.1035455064891
+    fy: 1130.1541762377883
+    cx: 951.0193473268226
+    cy: 581.0902322193278
+
+  camera_matrix:
+    rows: 3
+    cols: 3
+    data:
+      - 1130.1035455064891
+      - 0.0
+      - 951.0193473268226
+      - 0.0
+      - 1130.1541762377883
+      - 581.0902322193278
+      - 0.0
+      - 0.0
+      - 1.0
+
+  distortion_model: fisheye
+  distortion_coefficients:
+    rows: 1
+    cols: 4
+    data:
+      - -0.10949451690742605
+      - 0.01563345714193377
+      - -0.07072000499253979
+      - 0.04326396138302371
+
+extrinsics:
+  source_frame: lidar
+  target_frame: camera
+
+  rotation_lidar_to_camera:
+    rows: 3
+    cols: 3
+    data:
+      - -0.023465
+      - -0.999725
+      - 0.000279
+      - -0.009149
+      - -0.000065
+      - -0.999958
+      - 0.999683
+      - -0.023467
+      - -0.009145
+
+  translation_lidar_to_camera:
+    unit: meter
+    rows: 3
+    cols: 1
+    data:
+      - 0.101330
+      - -0.108852
+      - -0.082845
+
+  transform_lidar_to_camera:
+    rows: 4
+    cols: 4
+    data:
+      - -0.023465
+      - -0.999725
+      - 0.000279
+      - 0.101330
+      - -0.009149
+      - -0.000065
+      - -0.999958
+      - -0.108852
+      - 0.999683
+      - -0.023467
+      - -0.009145
+      - -0.082845
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0

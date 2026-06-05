@@ -61,6 +61,13 @@ R_base_cam = np.array([
 
 T_base_cam = np.array([0.013454, -0.006172, -0.346313], dtype=np.float64)
 
+R_fendui = np.array([
+    [-0.023465, -0.999725,  0.000279],
+    [-0.009149, -0.000065, -0.999958],
+    [0.999683, -0.023467, -0.009145]
+], dtype=np.float64)
+T_fendui = np.array([0.101330, -0.108852, -0.082845], dtype=np.float64)
+
 def project_lidar_to_image(
     xyz_lidar: np.ndarray,
     R_optical_lidar: np.ndarray,
